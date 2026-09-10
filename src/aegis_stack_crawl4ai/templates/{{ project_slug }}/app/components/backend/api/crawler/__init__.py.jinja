@@ -1,0 +1,8 @@
+"""Crawler service API package.
+
+``API_PREFIX`` is the one place the crawler's mount point is spelled.
+The plugin spec mounts the router there, the dashboard builds its
+endpoints from it and the CLI calls it, so none of them can drift.
+"""
+
+API_PREFIX = "/api/v1/crawler"

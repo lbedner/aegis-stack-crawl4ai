@@ -1,0 +1,34 @@
+"""FastAPI dependency providers for the crawler.
+
+One ``CrawlerService`` per process lives here, and everything that needs
+one asks for it: the API through ``get_crawler_service``, the health
+check directly. A second instance would mean a second connection pool
+kept alive for the life of the process.
+
+The settings mixin lives in ``settings.py`` (a leaf module) so the
+project's ``Settings`` composition doesn't pull in the runtime stack
+(``CrawlerService`` → logger → settings → ...) and trigger a circular
+import at module load.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from functools import lru_cache
+
+from app.services.crawler.service import CrawlerService
+
+
+@lru_cache(maxsize=1)
+def get_crawler() -> CrawlerService:
+    """The process-wide crawler: cheap to share, expensive to spin up."""
+    return CrawlerService()
+
+
+async def get_crawler_service() -> AsyncGenerator[CrawlerService]:
+    """FastAPI dep: yield the shared crawler service.
+
+    Generator shape so FastAPI can run shutdown logic later if we add
+    per-request setup; for now the body is just ``yield``.
+    """
+    yield get_crawler()

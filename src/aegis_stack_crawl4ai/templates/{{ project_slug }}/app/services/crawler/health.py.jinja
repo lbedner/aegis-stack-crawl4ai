@@ -1,0 +1,61 @@
+"""Crawler health check.
+
+Returns a ``ComponentStatus`` (the project's standard health-check
+return type) so the dashboard surfaces the crawler row alongside
+in-tree services. Counts come from ``CrawlerService.stats`` so the
+``GET /api/v1/crawler/stats`` route, this health check, and the
+dashboard modal all read through the same code path — no duplicate
+SQL anywhere.
+"""
+
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError, version
+
+from app.core.db import get_async_session
+from app.services.crawler import SERVICE_NAME
+from app.services.crawler.deps import get_crawler
+from app.services.system.models import ComponentStatus, ComponentStatusType
+
+
+def _crawl4ai_version() -> str:
+    """Return the installed ``crawl4ai`` version, or ``""`` if missing."""
+    try:
+        return version("crawl4ai")
+    except PackageNotFoundError:
+        return ""
+
+
+# ``deps`` owns the one instance; this is an alias so the health check
+# reads as its own module rather than reaching through a dependency
+# provider. ``stats`` only reads, so sharing it with in-flight fetches
+# costs nothing.
+crawler = get_crawler
+
+
+async def crawler_health() -> ComponentStatus:
+    """Return health of the crawler service."""
+    try:
+        async with get_async_session() as session:
+            stats = await crawler().stats(session)
+
+        return ComponentStatus(
+            name=SERVICE_NAME,
+            status=ComponentStatusType.HEALTHY,
+            message="OK",
+            metadata={
+                **stats.model_dump(),
+                # Stack view + modal subtitle. A plugin is in no label
+                # registry, so it names itself here; the framework's
+                # ``get_component_subtitle`` appends ``version``.
+                "subtitle": "Crawl4AI",
+                "version": _crawl4ai_version(),
+            },
+        )
+    except Exception as exc:
+        return ComponentStatus(
+            name=SERVICE_NAME,
+            status=ComponentStatusType.UNHEALTHY,
+            message=f"crawler health check failed: {exc}",
+            metadata={},
+        )

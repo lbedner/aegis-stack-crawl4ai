@@ -1,0 +1,456 @@
+"""
+Crawler service CLI commands.
+
+Talks to the running webserver via the FastAPI routes — no raw DB
+calls. Same shape as ``app/cli/health.py``: build an ``httpx`` client
+against the configured ``API_BASE_URL`` and hit the documented
+endpoints (``POST /crawl``, ``GET /pages``, ``GET /stats``).
+
+Usage::
+
+    <project> crawlstats
+    <project> crawlfetch https://example.com
+    <project> crawlfetch https://example.com -m campaign=march -m source=manual
+    <project> crawllist --limit 5
+    <project> crawllist --failed
+    <project> crawlretry-failed
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from typing import Any
+
+import httpx
+from rich import box
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+import typer
+
+from app.components.backend.api.crawler import API_PREFIX
+from app.core.config import settings
+from app.core.constants import Defaults
+from app.core.formatting import format_bytes, format_relative_time
+from app.services.crawler.options import MAX_DEPTH, CrawlOptions
+from app.services.crawler.schemas import CrawlSummary
+
+app = typer.Typer(
+    name="crawl",
+    help="Web crawling and scraping (Crawl4AI plugin).",
+    no_args_is_help=True,
+)
+console = Console()
+
+
+def _api_base() -> str:
+    return getattr(settings, "API_BASE_URL", "http://localhost:8000")
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=_api_base(),
+        timeout=httpx.Timeout(getattr(Defaults, "API_TIMEOUT", 30.0)),
+    )
+
+
+def _status(status_code: Any) -> str:
+    """A status code in the one colour every command agrees on: green
+    when the fetch landed, red when it did not, a dash when unknown."""
+    code = status_code or 0
+    colour = "green" if 0 < code < 400 else "red"
+    return f"[{colour}]{code or '—'}[/{colour}]"
+
+
+def _parse_metadata(pairs: list[str]) -> dict[str, Any]:
+    """Parse ``-m key=value`` pairs into a dict.
+
+    Values that parse as JSON are decoded (so ``-m count=5`` → int);
+    otherwise treated as strings.
+    """
+    out: dict[str, Any] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise typer.BadParameter(
+                f"--metadata expects key=value, got {pair!r}"
+            )
+        key, raw = pair.split("=", 1)
+        try:
+            out[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            out[key] = raw
+    return out
+
+
+# ---------------------------------------------------------------------
+# stats
+# ---------------------------------------------------------------------
+
+
+@app.command(help="Show document counts + last fetch timestamp.")
+async def stats() -> None:
+    async with _client() as client:
+        resp = await client.get(f"{API_PREFIX}/stats")
+        resp.raise_for_status()
+        data = resp.json()
+
+    failed = data.get("failed", 0) or 0
+    failed_color = "red" if failed else "green"
+
+    table = Table(title="Crawler stats", show_header=False, title_style="bold magenta")
+    table.add_column("metric", style="cyan", no_wrap=True)
+    table.add_column("value", style="bold")
+    table.add_row("Pages", f"[green]{data.get('pages', 0):,}[/green]")
+    table.add_row("Failed", f"[{failed_color}]{failed:,}[/{failed_color}]")
+    table.add_row(
+        "Last fetch",
+        f"[yellow]{format_relative_time(data.get('last_fetched_at'))}[/yellow]",
+    )
+    console.print(table)
+
+
+# ---------------------------------------------------------------------
+# fetch
+# ---------------------------------------------------------------------
+
+
+@app.command(help="Fetch one URL and persist the result.")
+async def fetch(
+    url: str = typer.Argument(..., help="URL to fetch."),
+    metadata: list[str] = typer.Option(
+        [],
+        "--metadata",
+        "-m",
+        help=(
+            "Repeatable ``key=value`` pairs attached to the stored "
+            "document. Values are JSON-decoded if possible "
+            "(``-m count=5`` → int)."
+        ),
+    ),
+    source_kind: str = typer.Option(
+        "crawl4ai",
+        "--source-kind",
+        help="Producer label written to the document's source_kind.",
+    ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help=(
+            "Bypass both crawl4ai's network cache and row-level dedup. "
+            "Default uses the cache (no network on repeat URLs) and "
+            "skips inserts when content hash matches an existing row. "
+            "Pass ``--fresh`` for a true re-fetch."
+        ),
+    ),
+) -> None:
+    # Snapshot the most recent id so we can tell whether the API wrote
+    # a new row or returned an existing one (the fast-path dedup case).
+    # A returned id ≤ the snapshot means it was deduped (no insert).
+    async with _client() as client:
+        prior_resp = await client.get(
+            f"{API_PREFIX}/pages",
+            params={"limit": 1},
+        )
+        prior_resp.raise_for_status()
+        prior_rows = prior_resp.json()
+        prior_max_id = prior_rows[0]["id"] if prior_rows else 0
+
+        payload = {
+            "url": url,
+            "doc_metadata": _parse_metadata(metadata),
+            "source_kind": source_kind,
+            "fresh": fresh,
+        }
+        resp = await client.post(f"{API_PREFIX}/crawl", json=payload)
+        if resp.status_code >= 400:
+            console.print(
+                f"[red]Fetch failed:[/red] {resp.status_code} {resp.text}",
+            )
+            raise typer.Exit(1)
+        doc = resp.json()
+
+    status_code = doc.get("status_code") or 0
+    deduped = (not fresh) and doc["id"] <= prior_max_id
+
+    if deduped:
+        marker, suffix = "[cyan]↻[/cyan]", " [cyan](cached • hash match)[/cyan]"
+    elif status_code < 400:
+        marker, suffix = "[green]✓[/green]", ""
+    else:
+        marker, suffix = "[red]✗[/red]", ""
+
+    console.print(
+        f"{marker} "
+        f"[cyan]id={doc['id']}[/cyan] "
+        f"status={_status(status_code)} "
+        f"[yellow]type={doc.get('content_type')}[/yellow] "
+        f"[dim]bytes={format_bytes(len(doc.get('content') or ''))}[/dim]"
+        f"{suffix}"
+    )
+
+
+# ---------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------
+
+
+@app.command(help="Crawl one or more URLs as a background job.")
+async def site(
+    urls: list[str] = typer.Argument(..., help="Seed URLs. A bare domain is fine."),
+    depth: int = typer.Option(
+        0, "--depth", "-d", min=0, max=MAX_DEPTH, help="How many links deep to follow."
+    ),
+    max_pages: int = typer.Option(
+        25, "--max-pages", min=1, max=500, help="Ceiling on pages per seed URL."
+    ),
+    selector: str = typer.Option(
+        "", "--selector", help="CSS selector: keep only this part of each page."
+    ),
+    min_words: int = typer.Option(
+        0, "--min-words", min=0, help="Drop blocks shorter than this many words."
+    ),
+    external: bool = typer.Option(
+        False, "--external", help="Follow links off the seed URL's site."
+    ),
+    fresh: bool = typer.Option(False, "--fresh", help="Bypass cache and dedup."),
+    source_kind: str = typer.Option("crawl4ai", "--source-kind"),
+) -> None:
+    """The same job the dashboard starts, from a terminal."""
+    options = CrawlOptions(
+        depth=depth,
+        max_pages=max_pages,
+        selector=selector or None,
+        min_words=min_words,
+        stay_on_domain=not external,
+        fresh=fresh,
+    )
+
+    async with _client() as client:
+        resp = await client.post(
+            f"{API_PREFIX}/crawl-batch",
+            json={
+                "urls": urls,
+                "options": options.model_dump(),
+                "source_kind": source_kind,
+            },
+        )
+        resp.raise_for_status()
+        job_id = resp.json()["job_id"]
+
+        console.print(f"[dim]job {job_id}[/dim]")
+        with console.status("Crawling...") as status:
+            while True:
+                await asyncio.sleep(1.0)
+                job = (await client.get(f"/api/v1/jobs/{job_id}")).json()
+                status.update(job.get("label") or "Crawling...")
+                if job.get("status") != "running":
+                    break
+
+    if job.get("status") != "done":
+        console.print(f"[red]{job.get('error') or 'The crawl failed.'}[/red]")
+        raise typer.Exit(1)
+
+    summary = CrawlSummary.model_validate(job.get("result") or {})
+    table = Table(title=f"Crawled {summary.fetched} page(s)", box=box.SIMPLE)
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    table.add_column("url")
+    for page in summary.pages:
+        table.add_row(_status(page.status), format_bytes(page.size), page.url)
+    console.print(table)
+    if summary.failed:
+        console.print(f"[yellow]{summary.failed} failed[/yellow]")
+
+
+@app.command("list", help="List recent pages.")
+async def list_pages(
+    limit: int = typer.Option(20, "--limit", "-n", help="Max rows to show."),
+    failed: bool = typer.Option(
+        False, "--failed", help="Only show fetches with status >= 400."
+    ),
+) -> None:
+    params: dict[str, Any] = {"limit": limit}
+    if failed:
+        params["failed_only"] = "true"
+
+    async with _client() as client:
+        resp = await client.get(f"{API_PREFIX}/pages", params=params)
+        resp.raise_for_status()
+        rows = resp.json()
+
+    if not rows:
+        console.print("[yellow]No pages yet.[/yellow]")
+        return
+
+    table = Table(
+        title=f"Crawled pages ({len(rows)})",
+        show_header=True,
+        header_style="bold magenta",
+        title_style="bold magenta",
+    )
+    table.add_column("id", justify="right", style="cyan", no_wrap=True)
+    table.add_column("status", justify="right", style="bold")
+    table.add_column("type", style="yellow")
+    table.add_column("bytes", justify="right", style="dim")
+    table.add_column("fetched_at", style="dim")
+    table.add_column("url", style="green", overflow="fold")
+    for r in rows:
+        table.add_row(
+            str(r["id"]),
+            _status(r.get("status_code")),
+            r.get("content_type") or "",
+            format_bytes(len(r.get("content") or "")),
+            format_relative_time(r.get("fetched_at")),
+            r.get("source_url") or "",
+        )
+    console.print(table)
+    console.print(f"\n[cyan]Total pages shown:[/cyan] {len(rows)}")
+
+
+# ---------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------
+
+
+@app.command(help="Show one document's body + metadata.")
+async def show(
+    page_id: int = typer.Argument(..., help="CrawledPage id to render."),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Print body as plain text instead of rendered Markdown / "
+        "syntax-highlighted HTML.",
+    ),
+    head: int = typer.Option(
+        0,
+        "--head",
+        "-h",
+        help="Print only the first N characters of the body. 0 = full.",
+    ),
+) -> None:
+    async with _client() as client:
+        resp = await client.get(f"{API_PREFIX}/pages/{page_id}")
+        if resp.status_code == 404:
+            console.print(f"[red]No document with id={page_id}[/red]")
+            raise typer.Exit(1)
+        resp.raise_for_status()
+        doc = resp.json()
+
+    status_code = doc.get("status_code") or 0
+
+    # Header table — id, url, status, content_type, fetched_at, metadata.
+    header = Table(
+        title=f"CrawledPage #{doc['id']}",
+        show_header=False,
+        box=None,
+        pad_edge=False,
+        title_style="bold magenta",
+    )
+    header.add_column("k", style="cyan", no_wrap=True)
+    header.add_column("v", overflow="fold")
+    header.add_row("source_url", f"[green]{doc.get('source_url') or ''}[/green]")
+    header.add_row("status", _status(status_code))
+    header.add_row("content_type", f"[yellow]{doc.get('content_type') or ''}[/yellow]")
+    header.add_row("source_kind", f"[dim]{doc.get('source_kind') or ''}[/dim]")
+    header.add_row(
+        "fetched_at", f"[dim]{format_relative_time(doc.get('fetched_at'))}[/dim]"
+    )
+    header.add_row("hash", f"[dim]{doc.get('content_hash') or ''}[/dim]")
+    if doc.get("doc_metadata"):
+        header.add_row("metadata", json.dumps(doc["doc_metadata"]))
+    console.print(header)
+    console.print()
+
+    body = doc.get("content") or ""
+    if not body:
+        console.print("[dim](no body)[/dim]")
+        return
+    if head and head > 0:
+        body = body[:head]
+
+    if raw:
+        console.print(body)
+        return
+
+    content_type = (doc.get("content_type") or "").lower()
+    if content_type == "markdown":
+        console.print(Panel(Markdown(body), title="content", border_style="dim"))
+    elif content_type in ("html", "json"):
+        console.print(
+            Panel(
+                Syntax(body, content_type, theme="ansi_dark", word_wrap=True),
+                title=f"content ({content_type})",
+                border_style="dim",
+            )
+        )
+    else:
+        console.print(Panel(body, title="content", border_style="dim"))
+
+
+# ---------------------------------------------------------------------
+# retry-failed
+# ---------------------------------------------------------------------
+
+
+@app.command("retry-failed", help="Re-fetch every document with status >= 400.")
+async def retry_failed(
+    limit: int = typer.Option(50, "--limit", "-n", help="Max retries."),
+) -> None:
+    async with _client() as client:
+        resp = await client.get(
+            f"{API_PREFIX}/pages",
+            params={"limit": limit, "failed_only": "true"},
+        )
+        resp.raise_for_status()
+        failed_rows = resp.json()
+
+        if not failed_rows:
+            console.print("[green]✓ Nothing to retry.[/green]")
+            return
+
+        console.print(
+            f"[bold yellow]Retrying {len(failed_rows)} failed fetches…[/bold yellow]"
+        )
+        successes = 0
+        for row in failed_rows:
+            url = row.get("source_url")
+            if not url:
+                continue
+            payload = {
+                "url": url,
+                "doc_metadata": row.get("doc_metadata") or {},
+                "source_kind": row.get("source_kind") or "crawl4ai",
+            }
+            try:
+                r = await client.post(f"{API_PREFIX}/crawl", json=payload)
+                if r.status_code < 400:
+                    new_doc = r.json()
+                    new_status = new_doc.get("status_code") or 0
+                    if new_status < 400:
+                        successes += 1
+                        console.print(f"  [green]✓[/green] [dim]{url}[/dim]")
+                    else:
+                        console.print(
+                            f"  [red]✗[/red] [dim]{url}[/dim] "
+                            f"[red](status {new_status})[/red]"
+                        )
+            except httpx.HTTPError as exc:
+                console.print(
+                    f"  [red]✗[/red] [dim]{url}[/dim]: [red]{exc}[/red]",
+                    markup=True,
+                )
+
+    fail_count = len(failed_rows) - successes
+    console.print(
+        f"\n[bold]Retried[/bold] [cyan]{len(failed_rows)}[/cyan] • "
+        f"[green]{successes} succeeded[/green] • "
+        f"[red]{fail_count} still failing[/red]"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(app())

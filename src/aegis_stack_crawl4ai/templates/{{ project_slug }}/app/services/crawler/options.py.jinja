@@ -1,0 +1,84 @@
+"""What a caller can ask a crawl to do.
+
+``CrawlerRunConfig`` takes about a hundred parameters. These are the
+handful that change what a person actually gets back, so they are the
+ones the API, the CLI and the dashboard share. Everything else keeps
+crawl4ai's own default, which is the point of not wrapping all of it.
+"""
+
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, Field
+
+MAX_DEPTH = 3
+"""Deepest link-following allowed.
+
+Depth is exponential in someone else's bandwidth, so this is a hard
+ceiling rather than a default that can be argued up per call.
+"""
+
+
+class CrawlOptions(BaseModel):
+    """Tunables for one crawl. Defaults reproduce the single-page fetch."""
+
+    depth: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_DEPTH,
+        description="How many links deep to follow. 0 fetches only the URLs given.",
+    )
+    max_pages: int = Field(
+        default=25,
+        ge=1,
+        le=500,
+        description="Ceiling on pages fetched per seed URL when depth > 0.",
+    )
+    stay_on_domain: bool = Field(
+        default=True,
+        description="Follow links only within the seed URL's registrable site.",
+    )
+    selector: str | None = Field(
+        default=None,
+        max_length=200,
+        description="CSS selector: keep only this part of each page.",
+    )
+    min_words: int = Field(
+        default=0,
+        ge=0,
+        le=1000,
+        description="Drop blocks shorter than this many words (nav, chrome).",
+    )
+    fresh: bool = Field(
+        default=False,
+        description="Bypass the cache and the store's dedup; always refetch.",
+    )
+
+
+def site_of(url: str) -> str | None:
+    """The host a URL belongs to, ignoring a leading ``www.``.
+
+    Stored on every row and grouped on for the sites view, so the
+    domain guard and the drill-down cannot disagree about what counts
+    as one site.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host.removeprefix("www.")
+
+
+def same_site(seed: str, found: str) -> bool:
+    """Whether ``found`` belongs to the same site as ``seed``.
+
+    Subdomains count as the same site; a bare host change does not.
+    crawl4ai is told not to leave the domain, but the promise shown in
+    the UI is ours, so results are checked here rather than trusted.
+    """
+    seed_site = site_of(seed)
+    found_site = site_of(found)
+    if seed_site is None or found_site is None:
+        return False
+    return found_site == seed_site or found_site.endswith(f".{seed_site}")

@@ -1,0 +1,35 @@
+"""Crawler-specific Pydantic settings.
+
+Composed into the project's ``Settings`` model via the plugin's
+``settings_mixins`` wiring entry. Lives in its own leaf module (no
+imports from the crawler package) so the settings composition done
+inside ``app/core/config.py`` doesn't pull in the runtime stack
+(``CrawlerService`` → logger → settings → ...) and trigger a circular
+import at module load.
+"""
+
+from __future__ import annotations
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+class CrawlerSettingsMixin(BaseSettings):
+    """Crawler-specific settings.
+
+    Override any of these via the project's ``.env`` file using the
+    field names below as env var keys.
+    """
+
+    CRAWLER_DEFAULT_TIMEOUT_S: int = Field(
+        default=30,
+        description="Per-URL fetch timeout in seconds.",
+    )
+    CRAWLER_MAX_CONCURRENCY: int = Field(
+        default=5,
+        description="Max concurrent in-flight requests for batch_fetch.",
+    )
+    CRAWLER_USER_AGENT: str = Field(
+        default="aegis-stack-crawl4ai/0.1",
+        description="User-Agent header sent on every request.",
+    )

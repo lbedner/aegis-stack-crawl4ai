@@ -1,0 +1,42 @@
+"""What the crawler's dashboard surfaces share.
+
+Beside the card and the tabs that read them, not in the service
+package: these are names, routes and cells for one frontend, and the
+service underneath is business logic that never renders anything.
+Both tabs read this module, so neither has to import the other.
+
+The subtitle itself is the framework's job: ``get_component_subtitle``
+already prefers the ``subtitle`` a plugin declares in its health
+metadata and appends the version.
+"""
+
+from typing import Any
+
+import flet as ft
+
+from app.components.backend.api.crawler import API_PREFIX
+from app.components.frontend.controls import ErrorText, SecondaryText
+from app.services.crawler import SERVICE_NAME
+
+MODAL_KEY = f"service_{SERVICE_NAME}"
+"""What the card dispatches on and what the modal registers under. One
+constant because a mismatch is a silently dead click, not an error."""
+
+STATS_ENDPOINT = f"{API_PREFIX}/stats"
+SITES_ENDPOINT = f"{API_PREFIX}/sites"
+PAGES_ENDPOINT = f"{API_PREFIX}/pages"
+CRAWL_BATCH_ENDPOINT = f"{API_PREFIX}/crawl-batch"
+
+
+def status_cell(status_code: Any) -> ft.Control:
+    """A failed fetch is the one value worth colouring."""
+    text = str(status_code) if status_code else "—"
+    if isinstance(status_code, int) and status_code >= 400:
+        return ErrorText(text)
+    return SecondaryText(text)
+
+
+def failed_cell(failed: Any) -> ft.Control:
+    """A site with failures is the one worth looking at."""
+    count = int(failed or 0)
+    return ErrorText(f"{count:,}") if count else SecondaryText("—")

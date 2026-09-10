@@ -1,0 +1,337 @@
+"""The Crawl tab: start a crawl, watch it, read what came back.
+
+Its own module for the same reason the Pages tab is: the crawler modal
+is three independent tabs sharing a dialog. ``PagePreview`` lives here
+because it exists only for this tab's result table.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import suppress
+from typing import Any
+
+import flet as ft
+
+from app.components.frontend.controls import (
+    DataTableColumn,
+    ExpandableDataTable,
+    ExpandableRow,
+    FormDropdown,
+    FormTextField,
+    H3Text,
+    SecondaryText,
+    ThemedSwitch,
+)
+from app.components.frontend.controls.buttons import PulseButton
+from app.components.frontend.controls.jobs import JobOutcome, follow_job
+from app.components.frontend.dashboard.crawler_ui import (
+    CRAWL_BATCH_ENDPOINT,
+    PAGES_ENDPOINT,
+    status_cell,
+)
+from app.components.frontend.state.session_state import get_session_state
+from app.components.frontend.theme import AegisTheme as Theme
+from app.core.formatting import format_bytes
+from app.core.log import logger
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.schemas import CrawledPageResult, CrawlSummary
+
+
+class CrawlTab(ft.Container):
+    """Start a crawl and watch it run.
+
+    The URLs go out as one background job; progress comes back over the
+    framework's own job stream, so nothing here polls and nothing here
+    knows where the work runs. ``follow_job`` is the same control the
+    page overlay and the documents pane sit on.
+    """
+
+    def __init__(self, page: ft.Page, on_finished: Callable[[], Any]) -> None:
+        super().__init__()
+        self._page = page
+        self._on_finished = on_finished
+        self._running = False
+
+        self._urls = FormTextField(
+            label="URLs",
+            hint="One per line",
+            multiline=True,
+            min_lines=4,
+            max_lines=8,
+        )
+        self._depth = FormDropdown(
+            label="Follow links",
+            options=[
+                ("0", "Just these URLs"),
+                ("1", "1 level deep"),
+                ("2", "2 levels deep"),
+                ("3", "3 levels deep"),
+            ],
+            value="0",
+            width=190,
+        )
+        self._max_pages = FormTextField(
+            label="Max pages", value="25", width=110
+        )
+        self._selector = FormTextField(
+            label="CSS selector", hint="main article", width=220
+        )
+        self._stay = ThemedSwitch(value=True)
+        self._start = PulseButton(
+            on_click_callable=self._start_crawl, text="Start crawl"
+        )
+        self._status = SecondaryText("")
+        self._summary = ft.Container()
+        # Fetched bodies, by page id. Toggling a row rebuilds the table,
+        # so without this every reopen would refetch.
+        self._bodies: dict[int, str] = {}
+
+        self.padding = Theme.Spacing.MD
+        self.expand = True
+        self.content = ft.Column(
+            [
+                self._urls,
+                ft.Row(
+                    [
+                        self._depth,
+                        self._max_pages,
+                        self._selector,
+                        ft.Row(
+                            [self._stay, SecondaryText("Stay on this site")],
+                            spacing=Theme.Spacing.SM,
+                        ),
+                    ],
+                    spacing=Theme.Spacing.MD,
+                    wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.END,
+                ),
+                ft.Row([self._start], alignment=ft.MainAxisAlignment.END),
+                ft.Container(content=self._status, padding=Theme.Spacing.SM),
+                self._summary,
+            ],
+            spacing=Theme.Spacing.SM,
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+    def _parse_urls(self) -> list[str]:
+        """One URL per line, blank lines ignored."""
+        raw = self._urls.value or ""
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def _options(self) -> CrawlOptions:
+        """The form as the model every caller passes.
+
+        Bad numbers fall back to the model's defaults rather than
+        failing the click: the field is a hint, not a gate.
+        """
+        try:
+            max_pages = int(self._max_pages.value or 0)
+        except ValueError:
+            max_pages = 0
+        return CrawlOptions(
+            depth=int(self._depth.value or 0),
+            max_pages=max_pages or CrawlOptions().max_pages,
+            stay_on_domain=bool(self._stay.value),
+            selector=(self._selector.value or "").strip() or None,
+        )
+
+    def _say(self, message: str) -> None:
+        self._status.value = message
+        with suppress(Exception):
+            self._status.update()
+
+    async def _start_crawl(self) -> None:
+        """The button's handler.
+
+        ``BaseElevatedButton`` awaits its callable with no arguments, and
+        a raise here reaches nobody: Flet drops it into a task nobody
+        retrieves, so the click looks like it did nothing. Everything
+        below therefore reports into the status line rather than out.
+        """
+        if self._running:
+            return
+        urls = self._parse_urls()
+        if not urls:
+            self._say("Enter at least one URL, one per line.")
+            return
+
+        self._running = True
+        self._set_button_enabled(False)
+        self._summary.content = None
+        self._say(f"Starting {len(urls)} URL(s)...")
+
+        try:
+            outcome = await self._run(urls)
+        except Exception as exc:  # noqa: BLE001 - the status line is the only place the user can see this
+            logger.exception("crawler.tab.start_failed", url_count=len(urls))
+            self._say(f"Could not start the crawl: {exc}")
+            return
+        finally:
+            self._running = False
+            self._set_button_enabled(True)
+
+        if outcome is None:
+            return
+        if outcome.error is not None:
+            self._say(outcome.error)
+            return
+        self._show_summary(outcome.result or {})
+        self._say("Done.")
+        await self._on_finished()
+
+    async def _run(self, urls: list[str]) -> JobOutcome | None:
+        """Start the job and follow it. None when the server started none."""
+        api = get_session_state(self._page).api_client
+        started = await api.post(
+            CRAWL_BATCH_ENDPOINT,
+            json={"urls": urls, "options": self._options().model_dump()},
+        )
+        job_id = started.get("job_id") if isinstance(started, dict) else None
+        if not job_id:
+            # ``api_client`` swallows the status code and logs it, so the
+            # reason is in the server log, not here. Name the one cause a
+            # user can act on.
+            self._say(
+                "The server refused those URLs. Check each line is a web "
+                "address."
+            )
+            return None
+        self._say("Queued. Waiting for the first page...")
+        return await follow_job(api, str(job_id), on_label=self._say)
+
+    def _set_button_enabled(self, enabled: bool) -> None:
+        self._start.disabled = not enabled
+        with suppress(Exception):
+            # The modal can be closed mid-crawl; a disposed control is
+            # not an error worth surfacing.
+            self._start.update()
+
+    _RESULT_COLUMNS = [
+        DataTableColumn("URL", style="primary"),
+        DataTableColumn("Type", width=100),
+        DataTableColumn("Status", width=80, alignment="right"),
+        DataTableColumn("Size", width=90, alignment="right"),
+    ]
+
+    def _show_summary(self, result: dict[str, Any]) -> None:
+        """What this run fetched, page by page, each one openable.
+
+        The counts alone say the job ran; they do not say what came
+        back, which is the only reason anyone watches a crawl. Expanding
+        a row shows the opening of the body, which is how you tell a
+        real page from an empty shell or a cookie wall.
+        """
+        # The frame is JSON on the wire; it becomes the model again here
+        # so the table reads fields rather than guessing at dict keys.
+        summary = CrawlSummary.model_validate(result)
+
+        headline = f"{summary.fetched:,} fetched"
+        if summary.failed:
+            headline += f", {summary.failed:,} failed"
+        if len(summary.pages) < summary.fetched:
+            headline += f" (showing the first {len(summary.pages):,})"
+
+        self._bodies.clear()
+        self._summary.content = ft.Column(
+            [
+                ft.Row(
+                    [H3Text("Last run"), SecondaryText(headline)],
+                    spacing=Theme.Spacing.SM,
+                    vertical_alignment=ft.CrossAxisAlignment.END,
+                ),
+                ExpandableDataTable(
+                    columns=self._RESULT_COLUMNS,
+                    rows=[self._result_row(page) for page in summary.pages],
+                ),
+            ],
+            spacing=Theme.Spacing.SM,
+        )
+        with suppress(Exception):
+            self._summary.update()
+
+    def _result_row(self, page: CrawledPageResult) -> ExpandableRow:
+        return ExpandableRow(
+            cells=[
+                page.url,
+                page.content_type,
+                status_cell(page.status),
+                format_bytes(page.size),
+            ],
+            # A factory, not a control: the body is only fetched for a
+            # row someone actually opens.
+            expanded_content=lambda p=page: PagePreview(
+                self._page, p, self._bodies
+            ),
+        )
+
+
+class PagePreview(ft.Container):
+    """The stored body of one crawled page, loaded when its row opens.
+
+    The snippet the job already carried renders immediately, so the row
+    is never blank while the rest is in flight. Expanding any row
+    rebuilds the whole table, so the fetched body is memoised by page id
+    in the tab: reopening a row costs nothing.
+    """
+
+    def __init__(
+        self,
+        page: ft.Page,
+        result: CrawledPageResult,
+        cache: dict[int, str],
+    ) -> None:
+        super().__init__()
+        self._page = page
+        self._result = result
+        self._cache = cache
+
+        self._body = ft.Text(
+            result.preview.strip(),
+            size=12,
+            font_family="monospace",
+            selectable=True,
+            color=Theme.Colors.TEXT_SECONDARY,
+        )
+        self._note = SecondaryText("")
+        self.content = ft.Column(
+            [self._body, self._note], spacing=Theme.Spacing.SM
+        )
+        self.padding = Theme.Spacing.MD
+
+        if not result.preview.strip():
+            self._body.value = ""
+            self._note.value = "Nothing came back for this URL."
+        elif result.size > len(result.preview):
+            self._note.value = "Loading the rest..."
+
+    def did_mount(self) -> None:  # type: ignore[override]
+        page_id = self._result.id
+        if page_id is None or self._result.size <= len(self._result.preview):
+            return
+        cached = self._cache.get(page_id)
+        if cached is not None:
+            self._show(cached)
+            return
+        self._page.run_task(self._load)
+
+    def _show(self, body: str) -> None:
+        self._body.value = body
+        self._note.value = ""
+        with suppress(Exception):
+            # The modal can close while a body is in flight.
+            self.update()
+
+    async def _load(self) -> None:
+        page_id = self._result.id
+        api = get_session_state(self._page).api_client
+        stored = await api.get(f"{PAGES_ENDPOINT}/{page_id}")
+        body = stored.get("content") if isinstance(stored, dict) else None
+        if not isinstance(body, str):
+            self._note.value = "Could not load the stored page."
+            with suppress(Exception):
+                self.update()
+            return
+        if page_id is not None:
+            self._cache[page_id] = body
+        self._show(body)

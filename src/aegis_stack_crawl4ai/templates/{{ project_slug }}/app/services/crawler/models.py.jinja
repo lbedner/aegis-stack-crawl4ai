@@ -1,0 +1,48 @@
+"""SQLModel definitions for the crawler service.
+
+Tables live in a dedicated ``crawler`` Postgres schema, kept apart from
+the project's other services. SQLite has no schemas, so there the table
+lands unqualified in the single database file.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import JSON, Column
+from sqlmodel import Field, SQLModel
+
+
+class CrawledPage(SQLModel, table=True):
+    """A single fetched document.
+
+    Generic on purpose — URL + content + JSONB ``doc_metadata`` covers
+    web pages, archive snapshots, API responses, RSS items, anything
+    URL-addressable. Future ingestion plugins can write to the same
+    table (or follow the same shape in their own).
+
+    ``doc_metadata`` rather than ``metadata`` because ``metadata`` is
+    reserved on SQLAlchemy's ``DeclarativeBase`` for the schema object.
+    """
+
+    __tablename__ = "crawled_page"
+{%- if database_engine == "postgres" %}
+    __table_args__ = {"schema": "crawler"}
+{%- endif %}
+
+    id: int | None = Field(default=None, primary_key=True)
+    source_url: str = Field(nullable=False, index=True)
+    site: str | None = Field(default=None, max_length=255, index=True)
+    content: str | None = Field(default=None)
+    content_hash: str | None = Field(default=None, max_length=64, index=True)
+    content_type: str = Field(default="html", max_length=32, nullable=False)
+    doc_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False, server_default="'{}'"),
+    )
+    status_code: int | None = Field(default=None)
+    source_kind: str = Field(default="crawl4ai", max_length=32, nullable=False)
+    fetched_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC), nullable=False, index=True
+    )

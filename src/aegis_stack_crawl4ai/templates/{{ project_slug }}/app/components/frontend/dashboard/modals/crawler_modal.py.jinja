@@ -1,0 +1,199 @@
+"""
+Crawler Service Detail Modal
+
+Displays crawler service stats — pages stored, failed count, last
+fetch timestamp — pulled live from ``GET /api/v1/crawler/stats`` via
+the standard dashboard ``api_client``. No raw DB calls; no reliance on
+stale health-poll snapshots.
+
+Follows the in-tree modal pattern (``DatabaseDetailDialog`` /
+``WorkerDetailDialog``): subclasses ``BaseDetailPopup``, builds tabs
+with mutable ``MetricCard`` controls, exposes ``update_data`` so the
+framework's modal cache can refresh values in place.
+"""
+
+from __future__ import annotations
+
+import flet as ft
+
+from app.components.frontend.dashboard.crawler_ui import MODAL_KEY, STATS_ENDPOINT
+from app.components.frontend.state.session_state import get_session_state
+from app.components.frontend.theme import AegisTheme as Theme
+from app.core.formatting import format_relative_time
+from app.services.system.models import ComponentStatus
+from app.services.system.ui import get_component_subtitle
+
+from ..cards.card_utils import get_status_detail
+from .base_detail_popup import BaseDetailPopup
+from .crawler_crawl_tab import CrawlTab
+from .crawler_pages_tab import PagesTab
+from .modal_sections import MetricCard, StatRowsSection
+
+
+class OverviewTab(ft.Container):
+    """Overview tab with mutable MetricCards.
+
+    Construction is cheap (placeholder values). Real numbers land via
+    ``refresh()`` which hits ``GET /api/v1/crawler/stats`` through the
+    dashboard's session-scoped ``api_client``. ``did_mount`` triggers
+    the first refresh; the modal's ``update_data`` re-fires it on every
+    reopen so cached modals never show stale figures.
+    """
+
+    def __init__(self, page: ft.Page) -> None:
+        super().__init__()
+        self._page = page
+
+        self._documents_card = MetricCard(
+            "Pages", "—", Theme.Colors.SUCCESS
+        )
+        self._failed_card = MetricCard("Failed", "—", Theme.Colors.INFO)
+        self._last_fetch_card = MetricCard(
+            "Last Fetch", "—", Theme.Colors.TEXT_SECONDARY
+        )
+
+        self._metrics_row = ft.Row(
+            [
+                self._documents_card,
+                self._failed_card,
+                self._last_fetch_card,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_AROUND,
+        )
+
+        # Statistics land on refresh; the section is swapped in place, the
+        # way every other live section in the dashboard is built.
+        self._stats_section = ft.Container()
+
+        self.content = ft.Column(
+            [
+                ft.Container(content=self._metrics_row, padding=Theme.Spacing.MD),
+                ft.Divider(height=20, color=ft.Colors.OUTLINE_VARIANT),
+                self._stats_section,
+            ],
+            spacing=0,
+            scroll=ft.ScrollMode.AUTO,
+        )
+        self.expand = True
+
+    def did_mount(self) -> None:  # type: ignore[override]
+        """First refresh once the tab is in the tree.
+
+        Flet's ``did_mount`` runs in a worker thread that has no
+        running event loop, so ``asyncio.create_task`` would raise
+        ``RuntimeError``. ``page.run_task`` schedules the coroutine
+        on the page's UI loop — same pattern auth_users_tab and
+        other in-tree modals use.
+        """
+        self._page.run_task(self.refresh)
+
+    async def refresh(self) -> None:
+        """Fetch fresh stats and update the metric cards in place."""
+        api = get_session_state(self._page).api_client
+        stats = await api.get(STATS_ENDPOINT)
+        if not isinstance(stats, dict):
+            return
+
+        pages = stats.get("pages") or 0
+        failed = stats.get("failed") or 0
+        last_fetched = format_relative_time(stats.get("last_fetched_at"))
+
+        self._documents_card.set_value(f"{pages:,}")
+        # Red means there is something to fix. No failures is not an
+        # informational state, it is the absence of one, so it reads in
+        # the ordinary text colour like every other count.
+        self._failed_card.set_value(
+            f"{failed:,}",
+            Theme.Colors.ERROR if failed else Theme.Colors.TEXT_SECONDARY,
+        )
+        self._last_fetch_card.set_value(last_fetched)
+
+        unique = stats.get("unique_urls") or 0
+        content_types = stats.get("content_types") or {}
+        self._stats_section.content = StatRowsSection(
+            "Statistics",
+            {
+                "Unique URLs": f"{unique:,}",
+                "Re-fetches": f"{max(pages - unique, 0):,}",
+                "Succeeded": (
+                    f"{max(pages - failed, 0):,} of {pages:,}"
+                    if pages
+                    else "—"
+                ),
+                "Content types": (
+                    ", ".join(
+                        f"{name} {count:,}"
+                        for name, count in sorted(content_types.items())
+                    )
+                    or "—"
+                ),
+            },
+        )
+        try:
+            self.update()
+        except Exception:
+            # Modal may have been disposed before the await resolved.
+            pass
+
+
+class CrawlerDetailDialog(BaseDetailPopup):
+    """Crawler service detail popup."""
+
+    def __init__(
+        self, component_data: ComponentStatus, page: ft.Page
+    ) -> None:
+        metadata = component_data.metadata or {}
+
+        self._overview_tab = OverviewTab(page)
+        self._pages_tab = PagesTab(page)
+        self._crawl_tab = CrawlTab(page, on_finished=self._refresh_after_crawl)
+
+        tabs = ft.Tabs(
+            selected_index=0,
+            animation_duration=200,
+            tabs=[
+                ft.Tab(text="Overview", content=self._overview_tab),
+                ft.Tab(text="Pages", content=self._pages_tab),
+                ft.Tab(text="Crawl", content=self._crawl_tab),
+            ],
+            expand=True,
+            label_color=ft.Colors.ON_SURFACE,
+            unselected_label_color=ft.Colors.ON_SURFACE_VARIANT,
+            indicator_color=ft.Colors.ON_SURFACE_VARIANT,
+        )
+
+        # Same subtitle the card shows, from the framework's helper.
+        subtitle = get_component_subtitle(MODAL_KEY, metadata)
+
+        super().__init__(
+            page=page,
+            component_data=component_data,
+            title_text="Crawler Service",
+            subtitle_text=subtitle,
+            sections=[tabs],
+            scrollable=False,
+            status_detail=get_status_detail(component_data),
+        )
+
+    async def _refresh_after_crawl(self) -> None:
+        """A finished crawl changed both the counts and the page list."""
+        await self._overview_tab.refresh()
+        await self._pages_tab.refresh()
+
+    def update_data(self, component_data: ComponentStatus) -> None:
+        """Hook the framework's modal-cache refresh path.
+
+        The dashboard caches modals; on reopen it calls ``update_data``
+        with the latest ``ComponentStatus`` snapshot. We don't trust that
+        snapshot for the metrics — it's whatever the last health poll
+        captured — so refresh straight from the API instead.
+        """
+        # Refresh the status pill in the title from the new snapshot.
+        self.update_status(
+            component_data.status, get_status_detail(component_data)
+        )
+        # Always hit the API for the metric values — use ``page.run_task``
+        # so the call works regardless of the caller's thread.
+        if self.page is not None:
+            self.page.run_task(self._overview_tab.refresh)
+            self.page.run_task(self._pages_tab.refresh)

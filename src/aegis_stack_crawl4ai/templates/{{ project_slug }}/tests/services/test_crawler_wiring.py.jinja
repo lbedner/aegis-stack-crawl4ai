@@ -1,0 +1,48 @@
+"""The knobs the plugin declares are the knobs it actually turns.
+
+``CrawlerSettingsMixin`` ships three settings into the project's
+``Settings``. A setting nobody reads is worse than no setting: it is a
+documented promise that silently does nothing, and someone tunes it in
+``.env`` and waits for a change that never comes.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from app.core.config import settings
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.service import CrawlerService
+
+
+class TestDeclaredSettingsAreRead:
+    def test_the_timeout_reaches_the_run_config(self) -> None:
+        config = CrawlerService.run_config(CrawlOptions())
+        # crawl4ai counts in milliseconds; the setting is in seconds.
+        assert config.page_timeout == settings.CRAWLER_DEFAULT_TIMEOUT_S * 1000
+
+    def test_the_user_agent_reaches_the_strategy(self) -> None:
+        headers = CrawlerService.http_config().headers or {}
+        assert headers.get("User-Agent") == settings.CRAWLER_USER_AGENT
+
+    @pytest.mark.asyncio
+    async def test_concurrency_defaults_to_the_setting(self) -> None:
+        """No explicit ceiling means the configured one, not a literal."""
+        seen: list[int] = []
+
+        class _Counting(CrawlerService):
+            async def crawl(self, *args: object, **kwargs: object) -> list:
+                seen.append(1)
+                return []
+
+        service = _Counting()
+        assert service.concurrency() == settings.CRAWLER_MAX_CONCURRENCY
+        assert service.concurrency(2) == 2
+
+
+def test_one_crawler_per_process() -> None:
+    """The health check and the API share an instance rather than each
+    standing up their own browser pool."""
+    from app.services.crawler import deps, health
+
+    assert health.crawler() is deps.get_crawler()

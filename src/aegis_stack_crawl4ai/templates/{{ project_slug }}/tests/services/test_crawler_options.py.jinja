@@ -1,0 +1,146 @@
+"""Crawl options: one model, mapped onto crawl4ai's run config.
+
+``CrawlerRunConfig`` takes a hundred parameters. These are the handful
+that change what a person gets, so they are the ones the API, the CLI
+and the dashboard all pass, and the only ones this maps.
+"""
+
+from typing import Any
+
+import pytest
+
+from app.services.crawler.options import CrawlOptions, same_site
+from app.services.crawler.service import CrawlerService
+
+
+class TestDefaults:
+    def test_a_bare_options_object_crawls_one_page(self) -> None:
+        """Depth zero is the behaviour every existing caller already has."""
+        options = CrawlOptions()
+        assert options.depth == 0
+        assert options.stay_on_domain is True
+
+    def test_depth_zero_attaches_no_deep_strategy(self) -> None:
+        config = CrawlerService.run_config(CrawlOptions())
+        assert config.deep_crawl_strategy is None
+
+
+class TestDeepCrawl:
+    def test_depth_attaches_a_bounded_strategy(self) -> None:
+        config = CrawlerService.run_config(CrawlOptions(depth=2, max_pages=7))
+        strategy = config.deep_crawl_strategy
+        assert strategy is not None
+        assert strategy.max_depth == 2
+        assert strategy.max_pages == 7
+
+    def test_depth_is_bounded(self) -> None:
+        """An unbounded depth on someone else's site is a mistake, not a
+        feature."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CrawlOptions(depth=99)
+
+
+class TestContentOptions:
+    def test_selector_and_word_threshold_reach_the_config(self) -> None:
+        config = CrawlerService.run_config(
+            CrawlOptions(selector="main article", min_words=25)
+        )
+        assert config.css_selector == "main article"
+        assert config.word_count_threshold == 25
+
+    def test_fresh_bypasses_the_cache(self) -> None:
+        from crawl4ai import CacheMode
+
+        assert CrawlerService.run_config(CrawlOptions(fresh=True)).cache_mode is (
+            CacheMode.BYPASS
+        )
+        assert CrawlerService.run_config(CrawlOptions()).cache_mode is (
+            CacheMode.ENABLED
+        )
+
+
+class TestDomainGuard:
+    """``include_external`` is passed to crawl4ai, but the promise is
+    ours to keep, so results are filtered on the way out too."""
+
+    @pytest.mark.parametrize(
+        ("seed", "found", "expected"),
+        [
+            ("https://a.test/x", "https://a.test/y", True),
+            ("https://a.test", "https://sub.a.test/y", True),
+            ("https://a.test", "https://b.test/y", False),
+            ("https://a.test", "https://www.a.test/y", True),
+            ("https://a.test", "not a url", False),
+        ],
+    )
+    def test_same_site(self, seed: str, found: str, expected: bool) -> None:
+        assert same_site(seed, found) is expected
+
+
+class TestCrawlReturnsEveryPage:
+    @pytest.mark.asyncio
+    async def test_a_deep_crawl_stores_each_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One seed URL, several stored pages."""
+        crawler = CrawlerService()
+        stored: list[str] = []
+
+        class _Result:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.success = True
+                self.status_code = 200
+                self.markdown = "body"
+                self.html = "<p>body</p>"
+
+        async def fake_arun(**kwargs: Any) -> list[_Result]:
+            return [
+                _Result("https://a.test"),
+                _Result("https://a.test/two"),
+                _Result("https://b.test/off"),
+            ]
+
+        class _Crawler:
+            arun = staticmethod(fake_arun)
+
+        async def fake_get_crawler() -> Any:
+            return _Crawler()
+
+        async def fake_store(_session: Any, result: Any, **_kw: Any) -> Any:
+            stored.append(result.url)
+            return result
+
+        crawler._get_crawler = fake_get_crawler  # type: ignore[method-assign]
+        crawler._store = fake_store  # type: ignore[method-assign]
+
+        await crawler.crawl(
+            object(), url="https://a.test", options=CrawlOptions(depth=1)
+        )
+
+        assert stored == ["https://a.test", "https://a.test/two"], (
+            "the off-domain result should have been filtered out"
+        )
+
+
+class TestSiteOf:
+    """One helper names the site a URL belongs to. The column, the
+    grouping and the domain guard all read it, so they cannot disagree
+    about what counts as the same site."""
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://a.test/x", "a.test"),
+            ("https://www.a.test/x", "a.test"),
+            ("http://SUB.A.test", "sub.a.test"),
+            ("not a url", None),
+            ("", None),
+        ],
+    )
+    def test_site_of(self, url: str, expected: str | None) -> None:
+        from app.services.crawler.options import site_of
+
+        assert site_of(url) == expected

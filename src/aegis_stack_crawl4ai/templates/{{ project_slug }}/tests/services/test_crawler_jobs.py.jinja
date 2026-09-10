@@ -1,0 +1,234 @@
+"""A crawl runs as a job: it narrates progress and hands back a job id.
+
+The dashboard never polls. It POSTs the URLs, gets ``202 {"job_id"}``,
+and reads the framework's ``/api/v1/jobs/{id}/events`` stream until the
+job lands. Everything here is the producing half of that contract: the
+labels the stream carries, and the summary the terminal frame carries.
+"""
+
+from contextlib import asynccontextmanager
+from typing import Any
+
+import pytest
+
+from app.services.crawler.dispatch import start_crawl
+from app.services.crawler.jobs import run_crawl
+from app.services.crawler.service import CrawlerService
+from app.services.system.jobs import get_job_runner
+
+
+@asynccontextmanager
+async def _session() -> Any:
+    yield object()
+
+
+def _factory() -> Any:
+    return _session()
+
+
+class _Page:
+    def __init__(
+        self,
+        status_code: int | None,
+        source_url: str = "https://a.test",
+        content_type: str = "markdown",
+        content: str | None = "body",
+        id: int | None = 1,
+    ) -> None:
+        self.id = id
+        self.status_code = status_code
+        self.source_url = source_url
+        self.content_type = content_type
+        self.content = content
+
+
+@pytest.mark.asyncio
+async def test_batch_fetch_reports_each_url_as_it_lands() -> None:
+    """One label per URL, so a stalled crawl is visibly stalled rather
+    than silent."""
+    crawler = CrawlerService()
+    labels: list[str] = []
+
+    async def fake_crawl(_session: Any, *, url: str, **_kwargs: Any) -> list[_Page]:
+        return [_Page(200, url)]
+
+    crawler.crawl = fake_crawl  # type: ignore[method-assign]
+    await crawler.batch_fetch(
+        _factory,
+        urls=["https://a.test", "https://b.test", "https://c.test"],
+        report=labels.append,
+    )
+
+    assert len(labels) == 3
+    assert "3" in labels[-1], "the last label should name the total"
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_summarises_what_happened() -> None:
+    """The terminal SSE frame carries this dict; the tab renders it."""
+    labels: list[str] = []
+
+    async def fake_batch(*_args: Any, **kwargs: Any) -> list[_Page]:
+        report = kwargs.get("report")
+        if report is not None:
+            report("working")
+        return [_Page(200), _Page(503), _Page(None)]
+
+    original = CrawlerService.batch_fetch
+    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
+    try:
+        summary = await run_crawl(
+            ["https://a.test", "https://b.test", "https://c.test"],
+            report=labels.append,
+        )
+    finally:
+        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+
+    assert summary.requested == 3
+    assert summary.fetched == 3
+    assert summary.failed == 2
+    assert labels, "the job narrated nothing"
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_says_what_it_fetched() -> None:
+    """Counts alone say it worked, not what you got. The result carries
+    a row per page so the tab can show them without a second request."""
+
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
+        return [
+            _Page(200, "https://a.test", "markdown", "hello", id=1),
+            _Page(503, "https://b.test", "html", None, id=2),
+        ]
+
+    original = CrawlerService.batch_fetch
+    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
+    try:
+        summary = await run_crawl(["https://a.test", "https://b.test"])
+    finally:
+        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+
+    assert [page.model_dump() for page in summary.pages] == [
+        {
+            "id": 1,
+            "url": "https://a.test",
+            "status": 200,
+            "content_type": "markdown",
+            "size": 5,
+            "preview": "hello",
+        },
+        {
+            "id": 2,
+            "url": "https://b.test",
+            "status": 503,
+            "content_type": "html",
+            "size": 0,
+            "preview": "",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_preview_is_a_snippet_not_the_whole_page() -> None:
+    """The rows ride an SSE frame, so a 200 KB page contributes a
+    snippet, not 200 KB."""
+    from app.services.crawler.jobs import PREVIEW_CHARS
+
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
+        return [_Page(200, content="x" * (PREVIEW_CHARS * 10))]
+
+    original = CrawlerService.batch_fetch
+    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
+    try:
+        summary = await run_crawl(["https://a.test"])
+    finally:
+        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+
+    row = summary.pages[0]
+    assert len(row.preview) == PREVIEW_CHARS
+    assert row.size == PREVIEW_CHARS * 10, "the real size is still reported"
+
+
+@pytest.mark.asyncio
+async def test_a_huge_crawl_does_not_ship_every_row() -> None:
+    """The result rides an SSE frame; the counts stay exact while the
+    rows are capped."""
+    from app.services.crawler.jobs import RESULT_PAGE_LIMIT
+
+    many = [_Page(200) for _ in range(RESULT_PAGE_LIMIT + 25)]
+
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
+        return many
+
+    original = CrawlerService.batch_fetch
+    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
+    try:
+        summary = await run_crawl(["https://a.test"] * len(many))
+    finally:
+        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+
+    assert summary.fetched == len(many)
+    assert len(summary.pages) == RESULT_PAGE_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_start_crawl_returns_a_job_the_runner_knows() -> None:
+    """The id the endpoint returns has to be the id the SSE stream
+    accepts, or the tab follows nothing."""
+
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
+        return [_Page(200)]
+
+    original = CrawlerService.batch_fetch
+    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
+    try:
+        job_id = await start_crawl(["https://a.test"])
+        snapshot = await get_job_runner().wait(job_id)
+    finally:
+        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+
+    assert snapshot.status == "done", snapshot.error
+    assert snapshot.result is not None
+    assert snapshot.result["fetched"] == 1, "the SSE frame carries plain JSON"
+
+
+class TestUrlNormalisation:
+    """People type ``example.com``. A crawler that refuses that with a
+    422 and no explanation is the crawler's problem, not theirs."""
+
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            ("example.com", "https://example.com"),
+            ("www.example.com/a", "https://www.example.com/a"),
+            ("  example.com  ", "https://example.com"),
+            ("http://example.com", "http://example.com"),
+            ("https://example.com", "https://example.com"),
+        ],
+    )
+    def test_a_missing_scheme_becomes_https(self, typed: str, expected: str) -> None:
+        from app.services.crawler.urls import normalize_url
+
+        assert normalize_url(typed) == expected
+
+    def test_the_batch_request_accepts_bare_domains(self) -> None:
+        from app.services.crawler.schemas import BatchCrawlRequest
+
+        request = BatchCrawlRequest(urls=["example.com", "https://b.test"])
+        assert [str(u) for u in request.urls] == [
+            "https://example.com/",
+            "https://b.test/",
+        ]
+
+    def test_the_single_request_accepts_a_bare_domain(self) -> None:
+        from app.services.crawler.schemas import CrawlRequest
+
+        assert str(CrawlRequest(url="example.com").url) == "https://example.com/"
+
+    def test_nonsense_is_still_refused(self) -> None:
+        from pydantic import ValidationError
+
+        from app.services.crawler.schemas import BatchCrawlRequest
+
+        with pytest.raises(ValidationError):
+            BatchCrawlRequest(urls=["not a url at all"])

@@ -1,0 +1,79 @@
+"""What a crawl job does, and what its SSE stream carries.
+
+``report`` becomes the job's label, so the dashboard shows "Fetched 3 of
+12" while the work runs. The returned dict becomes the job's result: the
+counts, plus a row per page so the tab can say what it actually got
+without going back to the API for it.
+"""
+
+from collections.abc import Callable
+
+from app.core.db import AsyncSessionLocal
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.schemas import CrawledPageResult, CrawlSummary
+from app.services.crawler.service import CrawlerService
+
+PREVIEW_CHARS = 400
+"""How much of a body travels back with the result.
+
+Enough to tell a real page from an empty shell or a cookie wall, small
+enough that a hundred of them still fit in one SSE frame. The whole body
+is in the store; this is a look, not a copy.
+"""
+
+RESULT_PAGE_LIMIT = 100
+"""Rows carried back in the job result.
+
+The result rides one SSE frame, so a thousand-URL crawl must not put a
+thousand rows in it. The counts stay exact; the rows are a sample, and
+every page is in the store either way.
+"""
+
+
+def _row(page: CrawledPage) -> CrawledPageResult:
+    """One stored page, as the dashboard needs it."""
+    body = page.content or ""
+    return CrawledPageResult(
+        id=page.id,
+        url=page.source_url,
+        status=page.status_code,
+        content_type=page.content_type,
+        size=len(body),
+        preview=body[:PREVIEW_CHARS],
+    )
+
+
+async def run_crawl(
+    urls: list[str],
+    *,
+    options: CrawlOptions | None = None,
+    source_kind: str = "crawl4ai",
+    report: Callable[[str], None] | None = None,
+) -> CrawlSummary:
+    """Fetch every URL, narrating progress, and report what came back.
+
+    A failed fetch is a stored row, not an exception, so the summary
+    counts them rather than the job failing on the first bad host.
+    """
+    crawler = CrawlerService()
+    try:
+        pages = await crawler.batch_fetch(
+            AsyncSessionLocal,
+            urls=urls,
+            options=options,
+            source_kind=source_kind,
+            report=report,
+        )
+    finally:
+        await crawler.aclose()
+
+    failed = sum(
+        1 for page in pages if not page.status_code or page.status_code >= 400
+    )
+    return CrawlSummary(
+        requested=len(urls),
+        fetched=len(pages),
+        failed=failed,
+        pages=[_row(page) for page in pages[:RESULT_PAGE_LIMIT]],
+    )

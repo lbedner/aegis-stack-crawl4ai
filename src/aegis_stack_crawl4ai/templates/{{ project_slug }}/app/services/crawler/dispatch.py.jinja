@@ -1,0 +1,46 @@
+"""Where a crawl runs.
+
+The framework's job runner gives this an id, a label stream and a
+result, and the dashboard follows it through
+``/api/v1/jobs/{job_id}/events`` without knowing anything about the
+crawler. That is the whole integration.
+
+A worker process would be the better home for a long crawl, but a
+plugin cannot register a worker task today: ``PluginWiring`` carries
+routers, settings mixins, health checks, cards and modals, and the
+queues are framework files. So this is the in-process path the
+documents service also falls back to when a stack has no worker: a real
+background task with real progress, in the webserver.
+"""
+
+from typing import Any
+
+from app.services.crawler.jobs import run_crawl
+from app.services.crawler.options import CrawlOptions
+from app.services.system.jobs import JobHandle, get_job_runner
+
+
+async def start_crawl(
+    urls: list[str],
+    *,
+    options: CrawlOptions | None = None,
+    source_kind: str = "crawl4ai",
+) -> str:
+    """Start the crawl and return the id its progress streams under."""
+
+    async def work(handle: JobHandle) -> dict[str, Any]:
+        summary = await run_crawl(
+            urls,
+            options=options,
+            source_kind=source_kind,
+            report=handle.set_label,
+        )
+        # The job result rides an SSE frame as JSON, so the model is
+        # dumped exactly here, at that boundary, and nowhere earlier.
+        return summary.model_dump()
+
+    return get_job_runner().start(
+        f"crawler-batch:{len(urls)}",
+        work,
+        label=f"Queued {len(urls)} URL(s)...",
+    )

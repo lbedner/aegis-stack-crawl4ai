@@ -1,0 +1,230 @@
+"""The Crawl tab's button actually reaches its handler.
+
+``BaseElevatedButton`` awaits its callable with no arguments. A handler
+that also takes the click event raises ``TypeError`` inside Flet's
+dispatch, which lands in a task nobody retrieves: the button looks dead,
+with no error anywhere the user can see. That is a contract between two
+files, so it is checked here rather than trusted.
+"""
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from app.components.frontend.dashboard.modals.crawler_crawl_tab import CrawlTab
+
+
+def _tab() -> CrawlTab:
+    async def _noop() -> None:
+        return None
+
+    return CrawlTab(SimpleNamespace(), on_finished=_noop)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_clicking_start_reaches_the_handler() -> None:
+    """With no URLs entered the handler returns early, which is enough:
+    the status line only changes if the click arrived."""
+    tab = _tab()
+    await tab._start.on_click(None)
+    assert "at least one URL" in tab._status.value
+
+
+@pytest.mark.asyncio
+async def test_a_failure_lands_in_the_status_line() -> None:
+    """Nothing may escape the handler; Flet would swallow it."""
+    tab = _tab()
+    tab._urls.value = "https://a.test"
+
+    async def boom(_urls: list[str]) -> Any:
+        raise RuntimeError("the API is down")
+
+    tab._run = boom  # type: ignore[method-assign]
+    await tab._start.on_click(None)
+
+    assert "the API is down" in tab._status.value
+    assert tab._start.disabled is False, "the button has to come back"
+
+
+def test_urls_are_parsed_one_per_line() -> None:
+    tab = _tab()
+    tab._urls.value = "  https://a.test \n\n https://b.test\n"
+    assert tab._parse_urls() == ["https://a.test", "https://b.test"]
+
+
+class TestOptions:
+    """The form is the model. A caller that mistypes a number gets the
+    default, not a failed click."""
+
+    def test_defaults_reproduce_a_plain_fetch(self) -> None:
+        options = _tab()._options()
+        assert options.depth == 0
+        assert options.stay_on_domain is True
+        assert options.selector is None
+
+    def test_the_form_is_read_into_the_model(self) -> None:
+        tab = _tab()
+        tab._depth.value = "2"
+        tab._max_pages.value = "40"
+        tab._selector.value = "  main article  "
+        tab._stay.value = False
+
+        options = tab._options()
+        assert options.depth == 2
+        assert options.max_pages == 40
+        assert options.selector == "main article"
+        assert options.stay_on_domain is False
+
+    def test_a_bad_page_count_falls_back(self) -> None:
+        from app.services.crawler.options import CrawlOptions
+
+        tab = _tab()
+        tab._max_pages.value = "lots"
+        assert tab._options().max_pages == CrawlOptions().max_pages
+
+
+class TestLazyPageBody:
+    """A row's body is fetched when it opens, once."""
+
+    @staticmethod
+    def _result(size: int = 5000, preview: str = "opening") -> Any:
+        from app.services.crawler.schemas import CrawledPageResult
+
+        return CrawledPageResult(
+            id=7, url="https://a.test", size=size, preview=preview
+        )
+
+    def test_the_row_hands_back_a_factory_not_a_body(self) -> None:
+        """The whole point: nothing is built for a row nobody opens."""
+        tab = _tab()
+        row = tab._result_row(self._result())
+        assert callable(row.expanded_content)
+
+    def test_a_cached_body_is_not_refetched(self) -> None:
+        from app.components.frontend.dashboard.modals.crawler_crawl_tab import (
+            PagePreview,
+        )
+
+        cache = {7: "the whole page"}
+        preview = PagePreview(SimpleNamespace(), self._result(), cache)  # type: ignore[arg-type]
+        preview.did_mount()
+        assert preview._body.value == "the whole page"
+        assert preview._note.value == ""
+
+    def test_a_body_that_already_fits_is_never_fetched(self) -> None:
+        """A short page arrived whole in the job result."""
+        from app.components.frontend.dashboard.modals.crawler_crawl_tab import (
+            PagePreview,
+        )
+
+        cache: dict[int, str] = {}
+        result = self._result(size=7, preview="opening")
+        preview = PagePreview(SimpleNamespace(), result, cache)  # type: ignore[arg-type]
+        preview.did_mount()
+        assert cache == {}
+        assert preview._body.value == "opening"
+
+    def test_an_empty_body_says_so(self) -> None:
+        from app.components.frontend.dashboard.modals.crawler_crawl_tab import (
+            PagePreview,
+        )
+
+        preview = PagePreview(SimpleNamespace(), self._result(size=0, preview=""), {})  # type: ignore[arg-type]
+        assert "Nothing came back" in preview._note.value
+
+
+class TestDrillDown:
+    """Sites, then that site's pages, then one page's body.
+
+    A deep crawl of one seed lands as hundreds of rows; the sites list
+    is what keeps the tab readable. Each level has to be reachable and
+    each has to come back, which is state, not rendering, so it is
+    checked here.
+    """
+
+    @staticmethod
+    def _tab() -> Any:
+        from app.components.frontend.dashboard.modals.crawler_pages_tab import (
+            PagesTab,
+        )
+
+        tab = PagesTab(SimpleNamespace(run_task=lambda *_a: None))  # type: ignore[arg-type]
+        tab._sites = [
+            {"site": "a.test", "pages": 3, "failed": 1},
+            {"site": "b.test", "pages": 1, "failed": 0},
+        ]
+        return tab
+
+    def test_it_opens_on_the_sites_list(self) -> None:
+        tab = self._tab()
+        assert tab._site is None
+        assert tab._open is None
+
+    def test_clicking_a_site_narrows_to_it(self) -> None:
+        tab = self._tab()
+        tab._open_site(1)
+        assert tab._site == "b.test"
+
+    def test_back_from_a_site_returns_to_the_sites_list(self) -> None:
+        tab = self._tab()
+        tab._open_site(0)
+        tab._go_back()
+        assert tab._site is None
+
+    def test_opening_a_page_shows_its_body(self) -> None:
+        tab = self._tab()
+        tab._open_site(0)
+        tab._pages = [{"id": 4, "source_url": "https://a.test/x", "content": "hello"}]
+        tab._open_page(0)
+        assert tab._open is not None
+        assert tab._body_text() == "hello"
+
+    def test_the_copy_button_hands_over_the_body(self) -> None:
+        """The button reads at click time, so it must read the open page."""
+        tab = self._tab()
+        tab._pages = [{"id": 4, "source_url": "https://a.test/x", "content": "hello"}]
+        tab._open_page(0)
+        view = tab._content_view()
+        copiers = [
+            control
+            for control in _walk(view)
+            if hasattr(control, "get_text")
+        ]
+        assert copiers, "the content view needs a copy button"
+        assert copiers[0].get_text() == "hello"
+
+    def test_the_rows_scroll_under_a_header_that_stays(self) -> None:
+        """A crawl produces more rows than fit. The rows move; the back
+        arrow and the site name do not go with them."""
+        tab = self._tab()
+        tab._open_site(0)
+        view = tab._pages_view()
+        assert view.scroll is None, "the level itself must not scroll"
+        tables = [c for c in _walk(view) if hasattr(c, "_expand_table")]
+        assert tables and tables[0]._expand_table, "the rows own the scroll"
+
+        tab._pages = [{"id": 4, "source_url": "https://a.test/x", "content": "x"}]
+        tab._open_page(0)
+        body = tab._content_view()
+        assert body.scroll is None
+        assert [c for c in _walk(body) if getattr(c, "scroll", None) is not None]
+
+    def test_back_from_a_page_returns_to_its_pages(self) -> None:
+        tab = self._tab()
+        tab._open_site(0)
+        tab._pages = [{"id": 4, "source_url": "https://a.test/x", "content": "hi"}]
+        tab._open_page(0)
+        tab._go_back()
+        assert tab._open is None
+        assert tab._site == "a.test"
+
+
+def _walk(control: Any) -> Any:
+    """Every control under this one, the copy button included."""
+    yield control
+    content = getattr(control, "content", None)
+    if content is not None:
+        yield from _walk(content)
+    for child in getattr(control, "controls", None) or []:
+        yield from _walk(child)

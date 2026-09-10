@@ -1,0 +1,122 @@
+"""FastAPI router for the crawler service.
+
+Lives here rather than in the service package for the same reason
+every in-tree service's router does: the service is business logic,
+the HTTP layer belongs to the backend component. Mounted at
+``/api/v1/crawler`` by the ``RouterWiring`` entry in the plugin spec.
+
+Endpoints:
+- ``POST /crawl`` — fetch one URL synchronously, return the stored doc.
+- ``GET /sites`` — the crawled sites, with counts.
+- ``GET /pages`` — list recent pages, optionally for one site.
+- ``GET /pages/{page_id}`` — fetch a single stored page.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.core.db import get_async_db
+from app.services.crawler.deps import get_crawler_service
+from app.services.crawler.dispatch import start_crawl
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.schemas import (
+    BatchCrawlRequest,
+    CrawledPageRead,
+    CrawlerSite,
+    CrawlerStats,
+    CrawlRequest,
+)
+from app.services.crawler.service import CrawlerService
+
+router = APIRouter()
+
+
+@router.post(
+    "/crawl",
+    response_model=CrawledPageRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def crawl_url(
+    payload: CrawlRequest,
+    crawler: CrawlerService = Depends(get_crawler_service),
+    session: AsyncSession = Depends(get_async_db),
+) -> CrawledPage:
+    """Fetch one URL and persist the result."""
+    return await crawler.fetch(
+        session,
+        url=str(payload.url),
+        doc_metadata=payload.doc_metadata,
+        source_kind=payload.source_kind,
+        fresh=payload.fresh,
+    )
+
+
+@router.post("/crawl-batch", status_code=status.HTTP_202_ACCEPTED)
+async def crawl_batch(payload: BatchCrawlRequest) -> JSONResponse:
+    """Start a crawl in the background and hand back its job id.
+
+    Progress is the framework's, not ours: the caller reads
+    ``/api/v1/jobs/{job_id}/events`` until the job lands.
+    """
+    job_id = await start_crawl(
+        [str(url) for url in payload.urls],
+        options=payload.options,
+        source_kind=payload.source_kind,
+    )
+    return JSONResponse(
+        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
+    )
+
+
+@router.get("/sites")
+async def list_sites(
+    crawler: CrawlerService = Depends(get_crawler_service),
+    session: AsyncSession = Depends(get_async_db),
+) -> list[CrawlerSite]:
+    """Every crawled site with its page and failure counts."""
+    return await crawler.sites(session)
+
+
+@router.get("/pages", response_model=list[CrawledPageRead])
+async def list_pages(
+    limit: int = Query(default=50, ge=1, le=500),
+    failed_only: bool = Query(default=False),
+    site: str | None = Query(default=None, max_length=255),
+    crawler: CrawlerService = Depends(get_crawler_service),
+    session: AsyncSession = Depends(get_async_db),
+) -> list[CrawledPage]:
+    """Most recent pages, newest first. ``site`` narrows to one host."""
+    return await crawler.list_pages(
+        session, limit=limit, failed_only=failed_only, site=site
+    )
+
+
+@router.get("/pages/{page_id}", response_model=CrawledPageRead)
+async def get_document(
+    page_id: int,
+    session: AsyncSession = Depends(get_async_db),
+) -> CrawledPage:
+    """Fetch a stored document by id."""
+    document = await session.get(CrawledPage, page_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="CrawledPage not found")
+    return document
+
+
+@router.get("/stats")
+async def crawler_stats(
+    crawler: CrawlerService = Depends(get_crawler_service),
+    session: AsyncSession = Depends(get_async_db),
+) -> CrawlerStats:
+    """Aggregate counts, distinct URLs, content-type split, last fetch.
+
+    Returns ``{pages, failed, unique_urls, content_types,
+    last_fetched_at}``.
+    Same numbers ``crawler_health`` reports under
+    ``ComponentStatus.metadata`` — the dashboard modal calls this route
+    so it never relies on stale health-poll snapshots.
+    """
+    return await crawler.stats(session)

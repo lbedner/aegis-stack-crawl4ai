@@ -1,0 +1,255 @@
+"""The Pages tab: sites, then pages, then one page's body.
+
+Its own module because the crawler modal is three independent tabs
+sharing a dialog, which is the shape every multi-tab modal in the
+dashboard already has. What the tabs have in common (routes, cells,
+labels) lives in ``dashboard.crawler_ui``, so no tab imports another.
+"""
+
+from __future__ import annotations
+
+from contextlib import suppress
+from typing import Any
+
+import flet as ft
+
+from app.components.frontend.controls import (
+    DataTable,
+    DataTableColumn,
+    H3Text,
+    SecondaryText,
+)
+from app.components.frontend.controls.buttons import BaseIconButton, IconCopyButton
+from app.components.frontend.dashboard.crawler_ui import (
+    PAGES_ENDPOINT,
+    SITES_ENDPOINT,
+    failed_cell,
+    status_cell,
+)
+from app.components.frontend.state.session_state import get_session_state
+from app.components.frontend.theme import AegisTheme as Theme
+from app.core.formatting import format_bytes, format_relative_time
+
+
+class PagesTab(ft.Container):
+    """Sites, then that site's pages, then one page's body.
+
+    A crawl that follows links lands as hundreds of rows for a handful
+    of sites, so the list nobody can read is not the one shown first.
+    Three levels, one at a time: the sites in the store, the pages of
+    the site you picked, the body of the page you opened. The back
+    arrow is the only way up, which keeps the state to two fields.
+
+    Everything reads ``GET /api/v1/crawler/{sites,pages}`` through the
+    session-scoped ``api_client``, in the dashboard's ``DataTable``, so
+    sorting, empty state and row styling match every other table.
+    """
+
+    _LIMIT = 100
+
+    _SITE_COLUMNS = [
+        DataTableColumn("Site", style="primary"),
+        DataTableColumn("Pages", width=80, alignment="right"),
+        DataTableColumn("Failed", width=80, alignment="right"),
+        DataTableColumn("Last fetch", width=140, alignment="right"),
+    ]
+
+    _PAGE_COLUMNS = [
+        DataTableColumn("URL", style="primary"),
+        DataTableColumn("Type", width=100),
+        DataTableColumn("Status", width=80, alignment="right"),
+        DataTableColumn("Fetched", width=140, alignment="right"),
+    ]
+
+    def __init__(self, page: ft.Page) -> None:
+        super().__init__()
+        self._page = page
+        # The whole navigation state: no site is the sites list, a site
+        # with no open page is its page list, both is the body view.
+        self._site: str | None = None
+        self._open: dict[str, Any] | None = None
+        self._sites: list[dict[str, Any]] = []
+        self._pages: list[dict[str, Any]] = []
+        # Same shape as the load-tests tab, the in-tree long-table tab:
+        # an expanding body Container whose content is swapped per level,
+        # and each level's own column owns the scrolling. Guessing a
+        # pixel height for the box instead is what left the rows below
+        # the fold unreachable.
+        self.padding = ft.padding.all(Theme.Spacing.MD)
+        self._body = ft.Container(expand=True)
+        self.content = self._body
+        self._draw()
+
+    def did_mount(self) -> None:  # type: ignore[override]
+        self._page.run_task(self.refresh)
+
+    async def refresh(self) -> None:
+        """Reload whichever level is showing.
+
+        The body view needs no call: the page list already carried the
+        content, so opening a row costs nothing.
+        """
+        api = get_session_state(self._page).api_client
+        if self._site is None:
+            rows = await api.get(SITES_ENDPOINT)
+            self._sites = [row for row in rows or [] if isinstance(row, dict)]
+        else:
+            rows = await api.get(
+                f"{PAGES_ENDPOINT}?limit={self._LIMIT}&site={self._site}"
+            )
+            self._pages = [row for row in rows or [] if isinstance(row, dict)]
+        self._draw()
+
+    def _draw(self) -> None:
+        self._body.content = self._render()
+        with suppress(Exception):
+            # The modal can be closed while a call is in flight.
+            self._body.update()
+
+    def _render(self) -> ft.Control:
+        if self._open is not None:
+            return self._content_view()
+        if self._site is not None:
+            return self._pages_view()
+        return self._sites_view()
+
+    def _open_site(self, index: int) -> None:
+        """Drill into the site on that row and load its pages."""
+        if not 0 <= index < len(self._sites):
+            return
+        self._site = str(self._sites[index].get("site") or "")
+        self._pages = []
+        self._draw()
+        self._page.run_task(self.refresh)
+
+    def _open_page(self, index: int) -> None:
+        """Open the body of the page on that row."""
+        if not 0 <= index < len(self._pages):
+            return
+        self._open = self._pages[index]
+        self._draw()
+
+    def _go_back(self) -> None:
+        """One level up: body to pages, pages to sites."""
+        if self._open is not None:
+            self._open = None
+            self._draw()
+            return
+        self._site = None
+        self._draw()
+        self._page.run_task(self.refresh)
+
+    async def _back_clicked(self) -> None:
+        """``BaseIconButton`` awaits its callable with no arguments."""
+        self._go_back()
+
+    def _header(self, title: str, *, trailing: ft.Control | None = None) -> ft.Row:
+        """Back arrow, where you are, and whatever acts on it."""
+        return ft.Row(
+            [
+                BaseIconButton(
+                    self._back_clicked,
+                    icon=ft.Icons.ARROW_BACK,
+                    tooltip="Back",
+                ),
+                ft.Container(content=H3Text(title), expand=True),
+                *([trailing] if trailing is not None else []),
+            ],
+            spacing=Theme.Spacing.SM,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    @staticmethod
+    def _level(*controls: ft.Control) -> ft.Column:
+        """One level of the drill-down, filling the tab body.
+
+        The column itself does not scroll: whatever sits above stays
+        put, and the last control is the one that fills what is left
+        and scrolls inside it. Scrolling the whole level instead would
+        take the back arrow and the site name away with the rows.
+        """
+        return ft.Column(
+            list(controls),
+            spacing=Theme.Spacing.SM,
+            expand=True,
+        )
+
+    def _sites_view(self) -> ft.Control:
+        table = DataTable(
+            columns=self._SITE_COLUMNS,
+            rows=[
+                [
+                    site.get("site") or "",
+                    f"{int(site.get('pages') or 0):,}",
+                    failed_cell(site.get("failed")),
+                    format_relative_time(site.get("last_fetched_at")),
+                ]
+                for site in self._sites
+            ],
+            empty_message="Nothing crawled yet",
+            on_row_click=self._open_site,
+            expand=True,
+        )
+        return self._level(table)
+
+    def _pages_view(self) -> ft.Control:
+        return self._level(
+            self._header(self._site or ""),
+            DataTable(
+                columns=self._PAGE_COLUMNS,
+                rows=[
+                    [
+                        doc.get("source_url") or "",
+                        doc.get("content_type") or "",
+                        status_cell(doc.get("status_code")),
+                        format_relative_time(doc.get("fetched_at")),
+                    ]
+                    for doc in self._pages
+                ],
+                empty_message="Nothing fetched for this site",
+                on_row_click=self._open_page,
+                expand=True,
+            ),
+        )
+
+    def _body_text(self) -> str:
+        """The open page's stored body, read at click time by the copy
+        button as well as rendered."""
+        body = (self._open or {}).get("content")
+        return body if isinstance(body, str) else ""
+
+    def _content_view(self) -> ft.Control:
+        page = self._open or {}
+        body = self._body_text()
+        return self._level(
+            self._header(
+                str(page.get("source_url") or ""),
+                trailing=IconCopyButton(self._body_text),
+            ),
+            SecondaryText(
+                " • ".join(
+                    part
+                    for part in (
+                        str(page.get("status_code") or ""),
+                        str(page.get("content_type") or ""),
+                        format_bytes(len(body)),
+                        format_relative_time(page.get("fetched_at")),
+                    )
+                    if part and part != "—"
+                )
+            ),
+            ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
+            ft.Column(
+                [
+                    ft.Text(
+                        body or "Nothing came back for this URL.",
+                        size=12,
+                        font_family="monospace",
+                        selectable=True,
+                        color=Theme.Colors.TEXT_SECONDARY,
+                    )
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+            ),
+        )

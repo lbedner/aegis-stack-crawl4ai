@@ -1,0 +1,137 @@
+"""Pydantic request / response schemas for the crawler API."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.urls import normalize_url
+
+
+class CrawlerStats(BaseModel):
+    """Aggregate counts the dashboard, the CLI and the health check share."""
+
+    pages: int = 0
+    failed: int = 0
+    unique_urls: int = 0
+    content_types: dict[str, int] = Field(default_factory=dict)
+    last_fetched_at: str | None = None
+
+
+class CrawlerSite(BaseModel):
+    """One crawled site and how much of it is in the store.
+
+    A deep crawl of one seed lands as many rows; this is the row the
+    dashboard lists before anyone drills into pages.
+    """
+
+    site: str
+    pages: int = 0
+    failed: int = 0
+    last_fetched_at: str | None = None
+
+
+class CrawledPageResult(BaseModel):
+    """One page a crawl produced, as the job result carries it.
+
+    ``preview`` is the opening of the body, not the body: these ride an
+    SSE frame. ``size`` is the real length, so a truncated preview is
+    still honest about what was fetched.
+    """
+
+    id: int | None = None
+    url: str
+    status: int | None = None
+    content_type: str = ""
+    size: int = 0
+    preview: str = ""
+
+
+class CrawlSummary(BaseModel):
+    """What a crawl job returns: the counts, and a sample of the pages."""
+
+    requested: int = 0
+    fetched: int = 0
+    failed: int = 0
+    pages: list[CrawledPageResult] = Field(default_factory=list)
+
+
+class BatchCrawlRequest(BaseModel):
+    """Inbound request: fetch many URLs as one background job."""
+
+    urls: list[HttpUrl] = Field(min_length=1, max_length=500)
+    options: CrawlOptions = Field(default_factory=CrawlOptions)
+
+    @field_validator("urls", mode="before")
+    @classmethod
+    def _accept_bare_domains(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [
+                normalize_url(item) if isinstance(item, str) else item
+                for item in value
+            ]
+        return value
+    source_kind: str = Field(
+        default="crawl4ai",
+        max_length=32,
+        description="Producer label stored on every row this job writes.",
+    )
+
+
+class CrawlRequest(BaseModel):
+    """Inbound request: fetch one URL and store the result."""
+
+    url: HttpUrl
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def _accept_a_bare_domain(cls, value: Any) -> Any:
+        return normalize_url(value) if isinstance(value, str) else value
+    doc_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Caller-supplied tags attached to the stored document. Free-"
+            "form JSONB; use it to thread your domain identifiers through "
+            "(e.g. ``{'ign_id': 5208, 'cluster': 9}``)."
+        ),
+    )
+    source_kind: str = Field(
+        default="crawl4ai",
+        max_length=32,
+        description=(
+            "Producer label. Multiple producers can share the pages "
+            "table; this column lets you filter by origin."
+        ),
+    )
+    fresh: bool = Field(
+        default=False,
+        description=(
+            "When ``true``, bypass crawl4ai's network cache AND skip "
+            "row-level dedup — every call hits the live URL and "
+            "always writes a new row. Default ``false`` is the fast "
+            "path: cache hits skip the network, identical content "
+            "skips the insert. Use ``fresh=true`` when you suspect "
+            "the cached body is stale, or when you need write-"
+            "history semantics."
+        ),
+    )
+
+
+class CrawledPageRead(BaseModel):
+    """Outbound shape of a stored document."""
+
+    id: int
+    source_url: str
+    site: str | None
+    content: str | None
+    content_hash: str | None
+    content_type: str
+    doc_metadata: dict[str, Any]
+    status_code: int | None
+    source_kind: str
+    fetched_at: datetime
+
+    model_config = {"from_attributes": True}

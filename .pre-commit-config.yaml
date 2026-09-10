@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Match aegis-stack's own ``.pre-commit-config.yaml`` so plugin
+    # authors get the same lint surface as core devs.
+    rev: v0.12.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

@@ -1,0 +1,112 @@
+"""Reads for the crawler service.
+
+Statement builders and their execution, nothing else: no writes, no
+business logic. Everything that asks the store a question comes
+through here, which is what makes an N+1 audit a read of one file.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import case, func, or_
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.services.crawler.models import CrawledPage
+
+_FAILED = or_(
+    CrawledPage.status_code.is_(None),
+    CrawledPage.status_code >= 400,
+)
+"""A fetch that produced nothing usable. Shared so the stats, the
+per-site counts and the retry queue cannot drift apart on what
+"failed" means."""
+
+
+async def page_with_hash(
+    db: AsyncSession, *, url: str, content_hash: str
+) -> CrawledPage | None:
+    """The most recent row for this URL whose body hashed the same.
+
+    The dedup gate on the write path: a hit means the fetch changed
+    nothing and needs no new row.
+    """
+    return (
+        await db.exec(
+            select(CrawledPage)
+            .where(CrawledPage.source_url == url)
+            .where(CrawledPage.content_hash == content_hash)
+            .order_by(CrawledPage.fetched_at.desc())
+            .limit(1)
+        )
+    ).first()
+
+
+async def recent_pages(
+    db: AsyncSession,
+    *,
+    limit: int = 50,
+    failed_only: bool = False,
+    site: str | None = None,
+) -> list[CrawledPage]:
+    """The most recent N pages, newest first."""
+    stmt = select(CrawledPage).order_by(CrawledPage.fetched_at.desc()).limit(limit)
+    if site:
+        stmt = stmt.where(CrawledPage.site == site)
+    if failed_only:
+        stmt = stmt.where(_FAILED)
+    return list((await db.exec(stmt)).all())
+
+
+async def site_rollup(db: AsyncSession) -> list[tuple[Any, Any, Any, Any]]:
+    """Per-site counts: site, pages, failed, last fetch.
+
+    One grouped query over the stored ``site`` column, so a deep crawl
+    of a thousand pages is still one row. Ordered by size, because the
+    site someone crawled hardest is the one they come back for.
+    """
+    rows = await db.exec(
+        select(
+            CrawledPage.site,
+            func.count(CrawledPage.id),
+            func.sum(case((_FAILED, 1), else_=0)),
+            func.max(CrawledPage.fetched_at),
+        )
+        .where(CrawledPage.site.is_not(None))
+        .group_by(CrawledPage.site)
+        .order_by(func.count(CrawledPage.id).desc(), CrawledPage.site)
+    )
+    return list(rows.all())
+
+
+async def totals(db: AsyncSession) -> tuple[int, int, int, datetime | None]:
+    """Pages, failed, distinct URLs and the last fetch, in one statement.
+
+    Four aggregates over the same rows is one scan, not four round
+    trips. Distinct URLs against the total is the store's re-fetch
+    depth, which is why both are counted.
+    """
+    row = (
+        await db.exec(
+            select(
+                func.count(CrawledPage.id),
+                func.sum(case((_FAILED, 1), else_=0)),
+                func.count(func.distinct(CrawledPage.source_url)),
+                func.max(CrawledPage.fetched_at),
+            )
+        )
+    ).one()
+    pages, failed, unique_urls, last = row
+    return int(pages or 0), int(failed or 0), int(unique_urls or 0), last
+
+
+async def content_type_counts(db: AsyncSession) -> dict[str, int]:
+    """One grouped query, not one per type."""
+    rows = await db.exec(
+        select(CrawledPage.content_type, func.count(CrawledPage.id)).group_by(
+            CrawledPage.content_type
+        )
+    )
+    return {str(name or "unknown"): int(count) for name, count in rows.all()}

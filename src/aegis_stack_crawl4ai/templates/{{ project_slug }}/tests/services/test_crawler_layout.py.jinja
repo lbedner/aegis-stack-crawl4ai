@@ -1,0 +1,49 @@
+"""The crawler service is held to the project's own service layout.
+
+A plugin ships into someone else's codebase, so it follows that
+codebase's rules rather than its own: reads live in ``queries``,
+routers live with the other routers under the backend component, and
+the service package is business logic. The framework's layout test
+names in-tree services only, so the same rules are stated here.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+
+SERVICE = "app.services.crawler"
+
+
+def _service_root() -> pathlib.Path:
+    package = pytest.importorskip(SERVICE)
+    return pathlib.Path(package.__file__).parent
+
+
+def test_every_read_lives_in_the_queries_module() -> None:
+    """A ``.exec(`` outside ``queries.py`` is a read the next N+1 audit
+    cannot find."""
+    root = _service_root()
+    offenders = [
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if ".exec(" in path.read_text() and path.name != "queries.py"
+    ]
+    assert not offenders, f"reads outside queries.py: {offenders}"
+
+
+def test_the_router_lives_with_the_other_routers() -> None:
+    """Every in-tree service keeps its FastAPI router under
+    ``app/components/backend/api/<service>/router.py``; the service
+    package holds no HTTP layer of its own."""
+    root = _service_root()
+    offenders = [
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if "APIRouter" in path.read_text()
+    ]
+    assert not offenders, f"routers inside the service package: {offenders}"
+
+    router = pytest.importorskip("app.components.backend.api.crawler.router")
+    assert router.router.routes, "the router moved but lost its routes"

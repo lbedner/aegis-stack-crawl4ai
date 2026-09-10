@@ -1,0 +1,27 @@
+"""Turning what someone typed into something fetchable.
+
+``example.com`` is what people write, in the dashboard and on the CLI.
+``HttpUrl`` refuses it: no scheme, so it parses as a relative reference.
+Rejecting that with a validation error is the crawler being pedantic
+about a case it can obviously resolve, so it resolves it here, once, on
+the way into every request model.
+"""
+
+_SCHEMES = ("http://", "https://")
+
+
+def normalize_url(raw: str) -> str:
+    """The URL to fetch for what the user typed.
+
+    A missing scheme becomes ``https://``. Anything that already names a
+    scheme is left exactly as it is, including ``http://``: downgrading
+    is the caller's choice to make, not ours. Whitespace is trimmed
+    because a pasted list carries it.
+    """
+    candidate = raw.strip()
+    if not candidate or candidate.startswith(_SCHEMES):
+        return candidate
+    if "://" in candidate:
+        # Some other scheme entirely (ftp, file). Let the URL type judge it.
+        return candidate
+    return f"https://{candidate}"

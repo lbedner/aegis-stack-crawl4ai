@@ -1,0 +1,407 @@
+"""Crawler service — async wrapper around ``crawl4ai.AsyncWebCrawler``.
+
+Provides a ``CrawlerService`` class with two surfaces:
+
+- ``fetch(url, doc_metadata=...)`` — fetch one URL, persist the
+  result, return the stored ``CrawledPage`` row.
+- ``batch_fetch(urls, ...)`` — concurrent fetch of many URLs, persist
+  each independently. Failures are recorded with their HTTP status
+  and the surviving rows let you query for retries.
+
+Persistence is generic: every fetch becomes a row in ``crawler.crawled_page``
+with ``source_url``, ``content``, ``content_hash`` (sha256), and a free-
+form ``doc_metadata`` JSONB. Re-fetching the same URL appends a new row;
+dedup-by-hash is a query the consumer runs when they care, not a write-
+path branch.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
+from crawl4ai import (
+    AsyncWebCrawler,
+    CacheMode,
+    CrawlerRunConfig,
+    HTTPCrawlerConfig,
+)
+from crawl4ai.async_crawler_strategy import AsyncHTTPCrawlerStrategy
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.core.config import settings
+from app.core.log import logger
+from app.core.storage import content_key
+from app.services.crawler import queries
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.options import CrawlOptions, same_site, site_of
+from app.services.crawler.schemas import CrawlerSite, CrawlerStats
+from app.services.system.activity import add_event
+
+
+def _hash_content(content: str | None) -> str | None:
+    """The digest half of the framework's content key.
+
+    ``app.core.storage.content_key`` is the project-wide way to address
+    bytes by what they are; using its digest here means this column and a
+    stored object agree on identity, so bodies could move into the object
+    store later without rehashing a single row.
+    """
+    if not content:
+        return None
+    return content_key(content.encode("utf-8")).rsplit("/", 1)[-1]
+
+
+class CrawlerService:
+    """Bulk URL fetcher with generic persistence.
+
+    Designed to be DI-friendly: takes an ``AsyncSession`` factory rather
+    than a session, so each fetch can run in its own transaction without
+    the caller having to thread sessions through.
+
+    The ``AsyncWebCrawler`` instance is lazily created on first use and
+    reused across calls — ``crawl4ai`` has its own pool inside, so
+    there's no benefit to one-per-call.
+
+    Uses ``AsyncHTTPCrawlerStrategy`` (pure ``httpx``, no browser binary):
+    the page is fetched as the server sends it. Client-rendered content
+    needs a browser strategy, which this plugin does not ship.
+    """
+
+    def __init__(self) -> None:
+        self._crawler: AsyncWebCrawler | None = None
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def http_config() -> HTTPCrawlerConfig:
+        """How the fetcher identifies itself.
+
+        ``CRAWLER_USER_AGENT`` is a declared setting, so it is read here
+        rather than left as a knob that turns nothing.
+        """
+        return HTTPCrawlerConfig(
+            headers={"User-Agent": settings.CRAWLER_USER_AGENT}
+        )
+
+    @staticmethod
+    def concurrency(requested: int | None = None) -> int:
+        """In-flight fetches allowed. The caller's number wins; otherwise
+        ``CRAWLER_MAX_CONCURRENCY``."""
+        return requested or settings.CRAWLER_MAX_CONCURRENCY
+
+    async def _get_crawler(self) -> AsyncWebCrawler:
+        """Lazily build the underlying crawler (idempotent + concurrent-safe)."""
+        if self._crawler is None:
+            async with self._lock:
+                if self._crawler is None:
+                    self._crawler = AsyncWebCrawler(
+                        crawler_strategy=AsyncHTTPCrawlerStrategy(
+                            browser_config=self.http_config()
+                        ),
+                        verbose=False,
+                    )
+                    await self._crawler.start()
+        return self._crawler
+
+    async def aclose(self) -> None:
+        """Shut down the underlying crawler."""
+        if self._crawler is not None:
+            await self._crawler.close()
+            self._crawler = None
+
+    async def fetch(
+        self,
+        session: AsyncSession,
+        *,
+        url: str,
+        doc_metadata: dict[str, Any] | None = None,
+        source_kind: str = "crawl4ai",
+        fresh: bool = False,
+    ) -> CrawledPage:
+        """Fetch one URL, persist the result, return the stored row.
+
+        Failures (HTTP errors, timeouts) still produce a row so the
+        crawled_page table doubles as the retry queue:
+        ``WHERE status_code >= 400 OR status_code IS NULL`` is the
+        unfetched-or-failed set.
+
+        ``fresh`` controls whether to bypass both crawl4ai's network
+        cache and our row-level dedup:
+
+        - ``False`` (default, fast path): use crawl4ai's
+          ``CacheMode.ENABLED`` so repeat fetches of the same URL
+          skip the network, AND row-dedup against the most recent
+          successful fetch's content hash so identical content
+          doesn't write a duplicate row. Same URL twice in a row →
+          no network call, no insert.
+        - ``True`` (force): pass ``CacheMode.BYPASS`` to crawl4ai
+          (always hit the network) and skip row dedup (always insert).
+          Use this for write-history semantics or when you suspect
+          the cached body is stale.
+        """
+        crawler = await self._get_crawler()
+        options = CrawlOptions(fresh=fresh)
+        # crawl4ai wraps ``arun`` in a decorator whose annotation reads as an
+        # unbound-or-bound union to the type checker; the call is correct.
+        result = await crawler.arun(  # ty: ignore[missing-argument]
+            url=url, config=self.run_config(options)
+        )
+        return await self._store(
+            session,
+            result,
+            url=url,
+            doc_metadata=doc_metadata,
+            source_kind=source_kind,
+            fresh=fresh,
+        )
+
+    @staticmethod
+    def run_config(options: CrawlOptions) -> CrawlerRunConfig:
+        """``CrawlOptions`` as the run config crawl4ai wants.
+
+        Only what the options name is set; every other parameter keeps
+        crawl4ai's default, which is why this wraps six of them and not
+        a hundred. A deep strategy is attached only when depth asks for
+        one, so depth 0 is exactly the single-page fetch it always was.
+        """
+        config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS if options.fresh else CacheMode.ENABLED,
+            css_selector=options.selector or None,
+            word_count_threshold=options.min_words or 1,
+            # crawl4ai counts in milliseconds; the setting is in seconds.
+            page_timeout=settings.CRAWLER_DEFAULT_TIMEOUT_S * 1000,
+        )
+        if options.depth > 0:
+            from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+            config.deep_crawl_strategy = BFSDeepCrawlStrategy(
+                max_depth=options.depth,
+                max_pages=options.max_pages,
+                include_external=not options.stay_on_domain,
+            )
+        return config
+
+    async def crawl(
+        self,
+        session: Any,
+        *,
+        url: str,
+        options: CrawlOptions | None = None,
+        doc_metadata: dict[str, Any] | None = None,
+        source_kind: str = "crawl4ai",
+    ) -> list[CrawledPage]:
+        """Fetch ``url`` and, when depth asks for it, what it links to.
+
+        A deep crawl makes ``arun`` return a list rather than one
+        result, so this is the shape every caller that might follow
+        links has to speak. ``stay_on_domain`` is enforced here as well
+        as passed down: the guarantee shown in the UI is ours to keep.
+        """
+        options = options or CrawlOptions()
+        crawler = await self._get_crawler()
+        outcome = await crawler.arun(  # ty: ignore[missing-argument]
+            url=url, config=self.run_config(options)
+        )
+        results = outcome if isinstance(outcome, list) else [outcome]
+
+        pages: list[CrawledPage] = []
+        for result in results:
+            found = str(getattr(result, "url", "") or url)
+            if options.stay_on_domain and not same_site(url, found):
+                logger.debug("crawler.crawl.offsite url=%s seed=%s", found, url)
+                continue
+            pages.append(
+                await self._store(
+                    session,
+                    result,
+                    url=found,
+                    doc_metadata=doc_metadata,
+                    source_kind=source_kind,
+                    fresh=options.fresh,
+                )
+            )
+        return pages
+
+    async def _store(
+        self,
+        session: Any,
+        result: Any,
+        *,
+        url: str,
+        doc_metadata: dict[str, Any] | None = None,
+        source_kind: str = "crawl4ai",
+        fresh: bool = False,
+    ) -> CrawledPage:
+        """One crawl4ai result, persisted. Shared by every fetch path."""
+        content: str | None = None
+        content_type = "html"
+        status_code: int | None = None
+
+        if getattr(result, "success", False):
+            content = (
+                getattr(result, "markdown", None)
+                or getattr(result, "html", None)
+            )
+            if getattr(result, "markdown", None):
+                content_type = "markdown"
+            status_code = getattr(result, "status_code", 200) or 200
+        else:
+            status_code = getattr(result, "status_code", None) or 599
+            logger.warning(
+                "crawler.fetch failed url=%s status=%s error=%s",
+                url,
+                status_code,
+                getattr(result, "error_message", None),
+            )
+
+        new_hash = _hash_content(content)
+
+        # Dedup gate — on by default, off when caller passed
+        # ``fresh=True``. Same URL + same content hash + previous
+        # successful fetch → return the existing row, no insert.
+        # Skipped when content is missing or status was a failure
+        # (failures always land so the retry queue stays accurate).
+        if not fresh and new_hash and (status_code or 0) < 400:
+            existing = await queries.page_with_hash(
+                session, url=url, content_hash=new_hash
+            )
+            if existing is not None:
+                add_event(
+                    component="crawler",
+                    event_type="fetch.dedup",
+                    message=f"Skipped duplicate fetch of {url}",
+                    status="success",
+                    details=f"hash match → returning row #{existing.id}",
+                )
+                return existing
+
+        document = CrawledPage(
+            source_url=url,
+            site=site_of(url),
+            content=content,
+            content_hash=new_hash,
+            content_type=content_type,
+            doc_metadata=doc_metadata or {},
+            status_code=status_code,
+            source_kind=source_kind,
+            fetched_at=datetime.now(UTC),
+        )
+        session.add(document)
+        await session.commit()
+        await session.refresh(document)
+
+        # Surface every fetch in the dashboard activity feed.
+        # Same convention every in-tree service uses (auth login,
+        # payment.checkout, etc).
+        add_event(
+            component="crawler",
+            event_type="fetch",
+            message=f"Fetched {url}",
+            status="success" if (status_code or 0) < 400 else "error",
+            details=(
+                f"{status_code} • {len(content or '')} bytes"
+                if content
+                else f"{status_code} • no content"
+            ),
+        )
+        return document
+
+    async def batch_fetch(
+        self,
+        session_factory: Any,
+        *,
+        urls: list[str],
+        doc_metadata_for: dict[str, dict[str, Any]] | None = None,
+        options: CrawlOptions | None = None,
+        source_kind: str = "crawl4ai",
+        max_concurrency: int | None = None,
+        report: Callable[[str], None] | None = None,
+    ) -> list[CrawledPage]:
+        """Concurrent fetch of many URLs.
+
+        ``session_factory`` is an ``async_sessionmaker`` (not a session)
+        — each fetch opens its own session/transaction so a single
+        failed write doesn't roll back its peers. ``doc_metadata_for``
+        maps URL → tags; URLs without entries get an empty dict.
+
+        ``report`` is called once per URL as it lands, which is what the
+        job's SSE stream carries: a crawl that has stalled on one slow
+        host looks stalled instead of silent.
+
+        ``max_concurrency`` defaults to ``CRAWLER_MAX_CONCURRENCY``.
+        """
+        options = options or CrawlOptions()
+        sem = asyncio.Semaphore(self.concurrency(max_concurrency))
+        meta_map = doc_metadata_for or {}
+        total = len(urls)
+        done = 0
+
+        async def _one(url: str) -> list[CrawledPage]:
+            nonlocal done
+            async with sem:
+                async with session_factory() as session:
+                    pages = await self.crawl(
+                        session,
+                        url=url,
+                        options=options,
+                        doc_metadata=meta_map.get(url, {}),
+                        source_kind=source_kind,
+                    )
+            done += 1
+            if report is not None:
+                # Depth turns one URL into many pages, so say both.
+                found = f" ({len(pages)} pages)" if len(pages) != 1 else ""
+                report(f"Fetched {done} of {total}{found}")
+            return pages
+
+        batches = await asyncio.gather(*(_one(u) for u in urls))
+        return [page for batch in batches for page in batch]
+
+    async def sites(self, session: AsyncSession) -> list[CrawlerSite]:
+        """Every crawled site with its page and failure counts."""
+        return [
+            CrawlerSite(
+                site=str(site),
+                pages=int(pages or 0),
+                failed=int(failed or 0),
+                last_fetched_at=last.isoformat() if last else None,
+            )
+            for site, pages, failed, last in await queries.site_rollup(session)
+        ]
+
+    async def list_pages(
+        self,
+        session: AsyncSession,
+        *,
+        limit: int = 50,
+        failed_only: bool = False,
+        site: str | None = None,
+    ) -> list[CrawledPage]:
+        """Return the most recent N pages, newest first."""
+        return await queries.recent_pages(
+            session, limit=limit, failed_only=failed_only, site=site
+        )
+
+    async def stats(self, session: AsyncSession) -> CrawlerStats:
+        """Aggregate counts, distinct URLs, content-type split, last fetch.
+
+        Single source of truth for the dashboard overview surfaces:
+
+        - the FastAPI route ``GET /api/v1/crawler/stats`` returns this
+        - ``crawler_health`` calls this so health metadata stays in lockstep
+        - the dashboard modal hits the same route via ``api_client``
+
+        No call site re-implements the count queries, and the whole
+        payload is two statements: one aggregate row, one grouped
+        content-type split.
+        """
+        pages, failed, unique_urls, last = await queries.totals(session)
+        return CrawlerStats(
+            pages=pages,
+            failed=failed,
+            unique_urls=unique_urls,
+            content_types=await queries.content_type_counts(session),
+            last_fetched_at=last.isoformat() if last else None,
+        )

@@ -1,0 +1,80 @@
+"""Crawler service card: how much has been fetched, and how recently."""
+
+import flet as ft
+
+from app.components.frontend.dashboard.crawler_ui import MODAL_KEY
+from app.core.formatting import format_relative_time
+from app.services.system.models import ComponentStatus
+from app.services.system.ui import get_component_subtitle
+
+from .card_container import CardContainer
+from .card_utils import (
+    create_header_row,
+    create_metric_container,
+    get_status_colors,
+)
+
+
+class CrawlerCard:
+    """Pages stored and the last fetch, from the health check."""
+
+    def __init__(self, component_data: ComponentStatus) -> None:
+        self.component_data = component_data
+        self.metadata = component_data.metadata or {}
+
+    def _create_metrics_section(self) -> ft.Container:
+        pages = self.metadata.get("pages", 0)
+        last_fetched = format_relative_time(self.metadata.get("last_fetched_at"))
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    # Row 1: Pages (full width)
+                    ft.Row(
+                        [create_metric_container("Pages", f"{pages:,}")],
+                        expand=True,
+                    ),
+                    ft.Container(height=12),
+                    # Row 2: Last fetch (full width)
+                    ft.Row(
+                        [create_metric_container("Last Fetch", last_fetched)],
+                        expand=True,
+                    ),
+                ],
+                spacing=0,
+            ),
+            expand=True,
+        )
+
+    def _create_card_content(self) -> ft.Container:
+        subtitle = get_component_subtitle(MODAL_KEY, self.metadata)
+        return ft.Container(
+            content=ft.Column(
+                [
+                    create_header_row(
+                        "Crawler Service",
+                        subtitle,
+                        self.component_data,
+                    ),
+                    self._create_metrics_section(),
+                ],
+                spacing=0,
+            ),
+            padding=ft.padding.all(16),
+            expand=True,
+        )
+
+    def build(self) -> ft.Container:
+        """Build the crawler card."""
+        _, _, border_color = get_status_colors(self.component_data)
+
+        return CardContainer(
+            content=self._create_card_content(),
+            border_color=border_color,
+            component_data=self.component_data,
+            # The key the click dispatches on. It must equal the key the
+            # modal registers under (``service_<health label>``), or the
+            # card is a no-op while the same modal opens fine from the
+            # stack view.
+            component_name=MODAL_KEY,
+        )

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegis-stack-crawl4ai"
+version = "0.0.1"
+description = "Aegis Stack plugin: crawl4ai"
+authors = [{ name = "Aegis Stack" }]
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["aegis-stack", "aegis-stack-plugin", "crawl4ai", "web-crawling"]
+dependencies = [
+    "aegis-stack",
+]
+
+[project.urls]
+"Aegis Plugin" = "https://aegis-stack.io/plugins/aegis-stack-crawl4ai"
+Homepage = "https://aegis-stack.io/plugins/aegis-stack-crawl4ai"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "ruff>=0.1.0",
+    "pre-commit>=3.7.0",
+]
+
+[project.entry-points."aegis.plugins"]
+crawl4ai = "aegis_stack_crawl4ai.plugin:get_spec"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegis_stack_crawl4ai"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

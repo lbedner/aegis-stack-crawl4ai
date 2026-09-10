@@ -1,0 +1,110 @@
+"""Crawled pages roll up into the sites they came from.
+
+A deep crawl of one seed produces many rows for one site. The dashboard
+drills down site, then page, then body, so the roll-up is a real query
+over a stored column rather than a scan that parses every URL.
+"""
+
+from contextlib import contextmanager
+from typing import Any
+
+import pytest
+from sqlalchemy import event
+
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.service import CrawlerService
+
+
+def _page(url: str, site: str, status: int = 200, content: str = "body") -> CrawledPage:
+    return CrawledPage(
+        source_url=url,
+        site=site,
+        content=content,
+        content_type="markdown",
+        status_code=status,
+    )
+
+
+@pytest.fixture
+async def stocked(async_db_session: Any) -> Any:
+    for page in (
+        _page("https://a.test/", "a.test"),
+        _page("https://a.test/two", "a.test"),
+        _page("https://a.test/bad", "a.test", status=503, content=""),
+        _page("https://b.test/", "b.test"),
+    ):
+        async_db_session.add(page)
+    await async_db_session.commit()
+    return async_db_session
+
+
+@pytest.mark.asyncio
+async def test_sites_roll_up_their_pages(stocked: Any) -> None:
+    sites = await CrawlerService().sites(stocked)
+    by_name = {site.site: site for site in sites}
+
+    assert by_name["a.test"].pages == 3
+    assert by_name["a.test"].failed == 1
+    assert by_name["b.test"].pages == 1
+    assert by_name["b.test"].failed == 0
+
+
+@pytest.mark.asyncio
+async def test_sites_are_ordered_by_size(stocked: Any) -> None:
+    """The site someone crawled hardest is the one they came back for."""
+    sites = await CrawlerService().sites(stocked)
+    assert [site.site for site in sites] == ["a.test", "b.test"]
+
+
+@pytest.mark.asyncio
+async def test_pages_can_be_filtered_to_one_site(stocked: Any) -> None:
+    pages = await CrawlerService().list_pages(stocked, site="b.test")
+    assert [p.source_url for p in pages] == ["https://b.test/"]
+
+
+@pytest.mark.asyncio
+async def test_a_stored_page_records_its_site(stocked: Any) -> None:
+    """The column is populated on the way in, not derived on the way out."""
+    pages = await CrawlerService().list_pages(stocked, site="a.test")
+    assert {p.site for p in pages} == {"a.test"}
+
+
+@contextmanager
+def counting(session: Any) -> Any:
+    """Every statement that reached the driver, while the block runs."""
+    statements: list[str] = []
+    engine = session.bind.sync_engine
+
+    def _seen(_conn: Any, _cur: Any, sql: str, *_rest: Any) -> None:
+        statements.append(sql)
+
+    event.listen(engine, "before_cursor_execute", _seen)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", _seen)
+
+
+@pytest.mark.asyncio
+async def test_stats_is_two_queries(stocked: Any) -> None:
+    """Five counts over one table is five round trips for one payload.
+
+    Everything but the content-type split is an aggregate over the same
+    rows, so it is one statement; the split needs its own GROUP BY.
+    """
+    with counting(stocked) as statements:
+        await CrawlerService().stats(stocked)
+
+    assert len(statements) == 2, statements
+
+
+@pytest.mark.asyncio
+async def test_stats_still_reports_the_same_numbers(stocked: Any) -> None:
+    """Collapsing the queries must not change a single figure."""
+    stats = await CrawlerService().stats(stocked)
+
+    assert stats.pages == 4
+    assert stats.failed == 1
+    assert stats.unique_urls == 4
+    assert stats.content_types == {"markdown": 4}
+    assert stats.last_fetched_at is not None
