@@ -19,12 +19,7 @@ Design notes:
 """
 
 from aegis.core.file_manifest import FileManifest
-from aegis.core.migration_spec import (
-    ColumnSpec,
-    IndexSpec,
-    MigrationSpec,
-    TableSpec,
-)
+from aegis.core.migration_spec import MigrationSpec
 from aegis.core.plugins.spec import (
     FrontendWidgetWiring,
     HealthCheckWiring,
@@ -52,9 +47,10 @@ def get_spec() -> PluginSpec:
         description="Web crawling and scraping via Crawl4AI",
         version="0.1.0",
         verified=False,
-        # PEP 440 specifier — pin to a CLI version that has the
-        # schema-isolation foundation. Loosen as the API stabilises.
-        aegis_version=">=0.6.11",
+        # PEP 440 specifier — the spec declares no tables (a revision is
+        # derived from the model), which the CLI only understands from
+        # 0.12 on.
+        aegis_version=">=0.12.0",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.
@@ -85,63 +81,6 @@ def get_spec() -> PluginSpec:
                 # qualifier there and the model gates ``__table_args__``
                 # on the engine, so one declaration serves both.
                 schema="crawler",
-                tables=[
-                    TableSpec(
-                        name="crawled_page",
-                        columns=[
-                            ColumnSpec(
-                                "id",
-                                "sa.Integer()",
-                                nullable=False,
-                                primary_key=True,
-                            ),
-                            ColumnSpec("source_url", "sa.Text()", nullable=False),
-                            ColumnSpec(
-                                "site",
-                                "sa.String(length=255)",
-                                nullable=True,
-                            ),
-                            ColumnSpec("content", "sa.Text()", nullable=True),
-                            ColumnSpec(
-                                "content_hash",
-                                "sa.String(length=64)",
-                                nullable=True,
-                            ),
-                            ColumnSpec(
-                                "content_type",
-                                "sa.String(length=32)",
-                                nullable=False,
-                            ),
-                            ColumnSpec(
-                                "doc_metadata",
-                                "sa.JSON()",
-                                nullable=False,
-                                default="'{}'",
-                            ),
-                            ColumnSpec("status_code", "sa.Integer()", nullable=True),
-                            ColumnSpec(
-                                "source_kind",
-                                "sa.String(length=32)",
-                                nullable=False,
-                                default="'crawl4ai'",
-                            ),
-                            ColumnSpec(
-                                "fetched_at",
-                                "sa.DateTime(timezone=True)",
-                                nullable=False,
-                            ),
-                        ],
-                        indexes=[
-                            IndexSpec("ix_crawled_page_source_url", ["source_url"]),
-                            IndexSpec("ix_crawled_page_site", ["site"]),
-                            IndexSpec(
-                                "ix_crawled_page_content_hash",
-                                ["content_hash"],
-                            ),
-                            IndexSpec("ix_crawled_page_fetched_at", ["fetched_at"]),
-                        ],
-                    ),
-                ],
             ),
         ],
         # All files this plugin owns inside the target project.

@@ -7,10 +7,53 @@ should be reflected here as a deliberate test update.
 
 from __future__ import annotations
 
-from aegis.core.migration_spec import MigrationSpec, TableSpec
+import re
+from pathlib import Path
+
+from aegis.core.migration_spec import MigrationSpec
 from aegis.core.plugins.spec import PluginKind, PluginSpec
 
 from aegis_stack_crawl4ai.plugin import get_spec
+
+MODEL = (
+    Path(__file__).resolve().parents[1]
+    / "src/aegis_stack_crawl4ai/templates/{{ project_slug }}"
+    / "app/services/crawler/models.py.jinja"
+).read_text()
+
+
+def _model_field_declarations() -> dict[str, str]:
+    """Each field on the crawled_page model, with its full declaration.
+
+    The revision is derived from this model, so the table's shape is
+    pinned here rather than in the spec. Read as text: the module is a
+    jinja template (the Postgres schema is gated on the engine), so it
+    does not import as-is.
+    """
+    fields: dict[str, str] = {}
+    current: str | None = None
+    for line in MODEL.splitlines():
+        match = re.match(r"    (\w+): ", line)
+        if match:
+            current = match.group(1)
+            fields[current] = line
+        elif current and line.startswith("        "):
+            fields[current] += "\n" + line
+        elif line.strip() and not line.startswith("    "):
+            current = None
+    return fields
+
+
+def _model_fields() -> set[str]:
+    return set(_model_field_declarations())
+
+
+def _model_indexed_fields() -> set[str]:
+    return {
+        name
+        for name, declaration in _model_field_declarations().items()
+        if "index=True" in declaration
+    }
 
 
 class TestIdentity:
@@ -42,10 +85,10 @@ class TestSchemaIsolation:
         assert spec.migrations
         migration = next(m for m in spec.migrations if isinstance(m, MigrationSpec))
         assert migration.schema == "crawler"
-        assert any(
-            isinstance(t, TableSpec) and t.name == "crawled_page"
-            for t in migration.tables
-        )
+        # The revision's contents come from the model; the spec names the
+        # object whose existence proves the revision ran.
+        assert migration.stamp_signature == ("table", "crawler.crawled_page")
+        assert '__tablename__ = "crawled_page"' in MODEL
 
 
 class TestDependencies:
@@ -63,15 +106,14 @@ class TestDependencies:
 
 
 class TestMigrations:
+    """The table's shape lives in the model - that is what the generated
+    project's revision is derived from - so these read the model."""
+
     def test_documents_columns_match_design(self) -> None:
         """Pin the pages-table shape — generic enough that future
         ingestion plugins (RSS, PDF, sitemap) can share the schema or
         copy the shape. See the plan file for the design discussion."""
-        spec = get_spec()
-        pages = next(
-            t for m in spec.migrations for t in m.tables if t.name == "crawled_page"
-        )
-        column_names = {c.name for c in pages.columns}
+        column_names = _model_fields()
         # Required columns the table contract has to maintain.
         for required in (
             "id",
@@ -91,14 +133,10 @@ class TestMigrations:
     def test_documents_indexes(self) -> None:
         """Three indexes for the three common query shapes:
         last-fetch-by-url, dedup-by-hash, time-window."""
-        spec = get_spec()
-        pages = next(
-            t for m in spec.migrations for t in m.tables if t.name == "crawled_page"
-        )
-        index_columns = {tuple(i.columns) for i in pages.indexes}
-        assert ("source_url",) in index_columns
-        assert ("content_hash",) in index_columns
-        assert ("fetched_at",) in index_columns
+        indexed = _model_indexed_fields()
+        assert "source_url" in indexed
+        assert "content_hash" in indexed
+        assert "fetched_at" in indexed
 
 
 class TestWiring:
