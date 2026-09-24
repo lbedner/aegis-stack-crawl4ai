@@ -1,0 +1,102 @@
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*.*.*-rc*'  # Pre-release tags (v0.1.0-rc1, etc.) → TestPyPI
+      - 'v*.*.*'      # Production tags (v0.1.0, etc.) → PyPI
+
+jobs:
+  build:
+    name: Build Package
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.11"  # The floor this plugin supports
+      UV_LINK_MODE: "copy"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv python install 3.11
+      - run: uv sync --all-extras
+      - run: make check
+      - run: uv build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: contains(github.ref, '-rc')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # REQUIRED for Trusted Publishing
+      contents: write  # For creating GitHub pre-releases
+    environment:
+      name: release-test
+      url: https://test.pypi.org/project/aegis-stack-crawl4ai/
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          print-hash: true
+      - id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: "v${{ steps.version.outputs.VERSION }} (Release Candidate)"
+          draft: true
+          generate_release_notes: true
+          prerelease: true
+          files: dist/*
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: "!contains(github.ref, '-rc')"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # REQUIRED for Trusted Publishing
+      contents: write  # For creating GitHub releases
+    environment:
+      name: release
+      url: https://pypi.org/project/aegis-stack-crawl4ai/
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
+          attestations: true  # Sigstore attestations
+      - id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: "v${{ steps.version.outputs.VERSION }}"
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Inside an Aegis Stack project:
+
+            ```bash
+            pip install aegis-stack-crawl4ai==${{ steps.version.outputs.VERSION }}
+            aegis add crawl4ai
+            ```
+
+            - [PyPI](https://pypi.org/project/aegis-stack-crawl4ai/${{ steps.version.outputs.VERSION }}/)
+            - [Aegis Stack](https://github.com/lbedner/aegis-stack)
+          files: dist/*
+          prerelease: false
