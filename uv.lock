@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "aegis-stack"
-version = "0.11.0"
+version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "copier" },
@@ -17,14 +17,14 @@ dependencies = [
     { name = "typer" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/c6/429ca4e2a7d6f3672d579f6688e6adb755e6f7c44c27a93eaea56b0edcdc/aegis_stack-0.11.0.tar.gz", hash = "sha256:97e6c0a60a95462bedad334c93ade7b31401cf4e0f6ae72c1075183ebdb91361", size = 6499901, upload-time = "2026-09-07T04:42:33.699Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/cb/c55ab6fa5d5fa4825977cf949daf7613bec8209444f09827dc8490765b77/aegis_stack-0.13.1.tar.gz", hash = "sha256:b48a4440194f5dae5aca4a944f7433b54d20c3d4d775ba0663caeeabce7e2375", size = 6958214, upload-time = "2026-09-24T15:14:39.861Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/ae/3c16adc66f31e7e313c4eae19dd962c5b730b510be4991a694223abceda4/aegis_stack-0.11.0-py3-none-any.whl", hash = "sha256:16da9258e48e30d5f432b93e471e500008a7114974ad224405ea3cf2bb37a0ea", size = 7043993, upload-time = "2026-09-07T04:42:31.681Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/d3/4b59122411e815dd04112250560582f9d9029666810768efb4e4a14ffb46/aegis_stack-0.13.1-py3-none-any.whl", hash = "sha256:9c9dac2beb10883246203f5ec3d32a99bed04da4bef1533e3a34e02f73843710", size = 7585613, upload-time = "2026-09-24T15:14:36.955Z" },
 ]
 
 [[package]]
 name = "aegis-stack-crawl4ai"
-version = "0.0.1"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aegis-stack" },
@@ -39,7 +39,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aegis-stack" },
+    { name = "aegis-stack", specifier = ">=0.13.1" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
@@ -723,7 +723,7 @@ wheels = [
 
 [[package]]
 name = "typer"
-version = "0.27.1"
+version = "0.27.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -731,9 +731,9 @@ dependencies = [
     { name = "rich" },
     { name = "shellingham" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ae/40/4a3db7990d1f62a53182aa96eaef57aeb2886a27f90a195bc66713565d31/typer-0.27.1.tar.gz", hash = "sha256:a79bef8469a79c45498e7b814ecf8d603cc7644e9acbd9e19cac0334240b18df", size = 203994, upload-time = "2026-08-03T14:41:03.438Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/f7/57713ba479fd405eb76de31404b2c744c289e336b2d999511ebf51e496f7/typer-0.27.2.tar.gz", hash = "sha256:269b7eb9d3c202ca84b4bc9618cb04ebb43d3d4d1e567e4c768607232c05f945", size = 204045, upload-time = "2026-08-28T10:26:55.046Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/43/89/9518bc0c3929bee36b3a4a8e3daddd6e03f92f9961c66d4983b837160543/typer-0.27.1-py3-none-any.whl", hash = "sha256:53150287edd11baeb4e4722c8e394fcdf8181c0ae89485cba8d25c778d5edd56", size = 122874, upload-time = "2026-08-03T14:41:04.391Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/bf/205d0004930ede8f542fb58f601526fccf4ae7626075ca1e6c4de5d3d652/typer-0.27.2-py3-none-any.whl", hash = "sha256:b3a5fc4342d5fc8fda8fc3010b1cf117e9249aab7fae800c2eff62fd3842d97d", size = 123130, upload-time = "2026-08-28T10:26:53.752Z" },
 ]
 
 [[package]]

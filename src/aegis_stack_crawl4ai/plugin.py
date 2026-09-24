@@ -49,8 +49,10 @@ def get_spec() -> PluginSpec:
         verified=False,
         # PEP 440 specifier — the spec declares no tables (a revision is
         # derived from the model), which the CLI only understands from
-        # 0.12 on.
-        aegis_version=">=0.12.0",
+        # 0.12 on. 0.13.1 is where the generated card-render test stops
+        # failing on a plugin's card, so anything older installs and then
+        # hands the user a red ``make check``.
+        aegis_version=">=0.13.1",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.

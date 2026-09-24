@@ -10,7 +10,11 @@ from typing import Any
 import pytest
 
 from app.services.crawler.options import CrawlOptions, same_site
-from app.services.crawler.service import CrawlerService
+from app.services.crawler.service import (
+    CrawlerService,
+    _page_metadata,
+    _status_from_error,
+)
 
 
 class TestDefaults:
@@ -123,6 +127,53 @@ class TestCrawlReturnsEveryPage:
         assert stored == ["https://a.test", "https://a.test/two"], (
             "the off-domain result should have been filtered out"
         )
+
+
+class TestFailureStatus:
+    """crawl4ai raises on a non-2xx and hands back a result with no
+    status_code, so every failed row used to read 599. The real status
+    is in the error text; ``retry-failed`` and the Pages tab both show
+    it, and a 404 is not a timeout."""
+
+    def test_it_reads_the_status_out_of_the_error(self) -> None:
+        message = (
+            "Unexpected error in _crawl_web at line 2826 in _handle_http:\n"
+            "Error: HTTP request failed: HTTP 404: Unexpected status code "
+            "for https://example.test/missing"
+        )
+        assert _status_from_error(message) == 404
+
+    def test_an_error_with_no_status_stays_unknown(self) -> None:
+        """A timeout or a DNS miss names no status — the caller's 599."""
+        assert _status_from_error("Connection timed out") is None
+        assert _status_from_error(None) is None
+
+
+class TestPageMetadata:
+    """A row carries what the page said about itself; the caller's own
+    keys are merged over it in ``_store``."""
+
+    def test_it_keeps_the_fields_a_page_supplied(self) -> None:
+        class _Result:
+            metadata = {
+                "title": "About",
+                "description": "A page",
+                "keywords": None,
+                "author": "Someone",
+                "internal": "dropped",
+            }
+
+        assert _page_metadata(_Result()) == {
+            "title": "About",
+            "description": "A page",
+            "author": "Someone",
+        }
+
+    def test_a_page_with_no_metadata_is_an_empty_dict(self) -> None:
+        class _Result:
+            metadata = None
+
+        assert _page_metadata(_Result()) == {}
 
 
 class TestSiteOf:
