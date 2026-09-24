@@ -18,6 +18,7 @@ path branch.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -39,6 +40,32 @@ from app.services.crawler.models import CrawledPage
 from app.services.crawler.options import CrawlOptions, same_site, site_of
 from app.services.crawler.schemas import CrawlerSite, CrawlerStats
 from app.services.system.activity import add_event
+
+
+# crawl4ai's HTTP strategy raises on any non-2xx, so the result it hands
+# back has ``status_code=None`` and the real status survives only in the
+# error text: "HTTP 404: Unexpected status code for <url>".
+_STATUS_IN_ERROR = re.compile(r"HTTP (\d{3}):")
+
+# Page metadata crawl4ai parses out of the document, worth keeping on the
+# row. Anything else the caller wants, they pass in.
+_METADATA_KEYS = ("title", "description", "keywords", "author")
+
+
+def _status_from_error(message: str | None) -> int | None:
+    """The HTTP status buried in a crawl4ai error message, if it is one."""
+    match = _STATUS_IN_ERROR.search(message or "")
+    return int(match.group(1)) if match else None
+
+
+def _page_metadata(result: Any) -> dict[str, Any]:
+    """Title, description, keywords, author — whichever the page had."""
+    parsed = getattr(result, "metadata", None) or {}
+    return {
+        key: parsed[key]
+        for key in _METADATA_KEYS
+        if isinstance(parsed, dict) and parsed.get(key)
+    }
 
 
 def _hash_content(content: str | None) -> str | None:
@@ -248,7 +275,13 @@ class CrawlerService:
                 content_type = "markdown"
             status_code = getattr(result, "status_code", 200) or 200
         else:
-            status_code = getattr(result, "status_code", None) or 599
+            status_code = (
+                getattr(result, "status_code", None)
+                or _status_from_error(getattr(result, "error_message", None))
+                # Nothing said what went wrong: a timeout, a DNS miss, a
+                # refused connection. 599 is the catch-all, not the norm.
+                or 599
+            )
             logger.warning(
                 "crawler.fetch failed url=%s status=%s error=%s",
                 url,
@@ -283,7 +316,7 @@ class CrawlerService:
             content=content,
             content_hash=new_hash,
             content_type=content_type,
-            doc_metadata=doc_metadata or {},
+            doc_metadata={**_page_metadata(result), **(doc_metadata or {})},
             status_code=status_code,
             source_kind=source_kind,
             fetched_at=datetime.now(UTC),

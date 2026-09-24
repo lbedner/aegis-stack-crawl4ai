@@ -8,6 +8,7 @@ should be reflected here as a deliberate test update.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 from aegis.core.migration_spec import MigrationSpec
@@ -69,6 +70,14 @@ class TestIdentity:
         """Third-party plugins must declare ``verified=False`` so the CLI
         flags them appropriately in ``aegis plugins list``."""
         assert get_spec().verified is False
+
+    def test_version_matches_the_package(self) -> None:
+        """``aegis plugins list`` prints the spec's version and PyPI
+        prints pyproject's. They are one release, so they agree."""
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        assert get_spec().version == pyproject["project"]["version"]
 
     def test_aegis_version_pinned(self) -> None:
         """Pin to a CLI version that has the schema-isolation foundation."""

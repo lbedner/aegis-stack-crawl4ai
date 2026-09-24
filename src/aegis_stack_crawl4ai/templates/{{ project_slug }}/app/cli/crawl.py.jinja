@@ -48,7 +48,11 @@ console = Console()
 
 
 def _api_base() -> str:
-    return getattr(settings, "API_BASE_URL", "http://localhost:8000")
+    # Fall back to the port this project actually serves on, not a
+    # hardcoded 8000: whatever else is listening there answers first,
+    # and its 401 looks like ours.
+    port = getattr(settings, "PORT", 8000)
+    return getattr(settings, "API_BASE_URL", None) or f"http://localhost:{port}"
 
 
 def _client() -> httpx.AsyncClient:

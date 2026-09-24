@@ -23,7 +23,11 @@ class CrawlerCard:
         self.metadata = component_data.metadata or {}
 
     def _create_metrics_section(self) -> ft.Container:
+        # The health payload is whatever the service published; a
+        # non-number must render, not raise.
         pages = self.metadata.get("pages", 0)
+        if not isinstance(pages, int):
+            pages = 0
         last_fetched = format_relative_time(self.metadata.get("last_fetched_at"))
 
         return ft.Container(
