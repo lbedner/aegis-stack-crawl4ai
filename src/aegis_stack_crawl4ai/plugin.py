@@ -45,7 +45,7 @@ def get_spec() -> PluginSpec:
         name="crawl4ai",
         kind=PluginKind.SERVICE,
         description="Web crawling and scraping via Crawl4AI",
-        version="0.1.0rc2",
+        version="0.1.0",
         verified=False,
         # PEP 440 specifier — the spec declares no tables (a revision is
         # derived from the model), which the CLI only understands from
