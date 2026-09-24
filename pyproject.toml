@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aegis-stack-crawl4ai"
-version = "0.1.0"
-description = "Aegis Stack plugin: crawl4ai"
+version = "0.1.0rc2"
+description = "Web crawling and scraping for Aegis Stack projects, via Crawl4AI"
+readme = "README.md"
 authors = [{ name = "Aegis Stack" }]
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -18,6 +19,7 @@ dependencies = [
 [project.urls]
 "Aegis Plugin" = "https://aegis-stack.io/plugins/aegis-stack-crawl4ai"
 Homepage = "https://aegis-stack.io/plugins/aegis-stack-crawl4ai"
+Crawl4AI = "https://github.com/unclecode/crawl4ai"
 
 [project.optional-dependencies]
 dev = [
