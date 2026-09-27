@@ -210,3 +210,27 @@ class TestFileManifest:
         Anything the plugin creates outside this list will be orphaned."""
         spec = get_spec()
         assert "app/services/crawler" in spec.files.primary
+
+    def test_every_rendered_file_is_owned(self) -> None:
+        """The manifest once left out the tests, so ``aegis remove`` left
+        them behind importing modules it had just deleted."""
+        from pathlib import Path
+
+        import aegis_stack_crawl4ai
+
+        slug = (
+            Path(aegis_stack_crawl4ai.__file__).parent
+            / "templates"
+            / "{{ project_slug }}"
+        )
+        owned = get_spec().files.primary
+        unowned = [
+            str(rel.with_suffix("") if rel.suffix == ".jinja" else rel)
+            for rel in (p.relative_to(slug) for p in slug.rglob("*") if p.is_file())
+            if not any(
+                str(rel).startswith(entry.rstrip("/") + "/")
+                or str(rel.with_suffix("")) == entry
+                for entry in owned
+            )
+        ]
+        assert not unowned, f"rendered but not in files.primary: {unowned}"

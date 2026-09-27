@@ -97,6 +97,12 @@ def get_spec() -> PluginSpec:
                 "app/components/frontend/dashboard/modals/crawler_pages_tab.py",
                 "app/components/frontend/dashboard/modals/crawler_crawl_tab.py",
                 "app/cli/crawl.py",
+                "tests/services/test_crawler_jobs.py",
+                "tests/services/test_crawler_layout.py",
+                "tests/services/test_crawler_options.py",
+                "tests/services/test_crawler_sites.py",
+                "tests/services/test_crawler_wiring.py",
+                "tests/components/frontend/test_crawler_tab.py",
             ]
         ),
         wiring=PluginWiring(
