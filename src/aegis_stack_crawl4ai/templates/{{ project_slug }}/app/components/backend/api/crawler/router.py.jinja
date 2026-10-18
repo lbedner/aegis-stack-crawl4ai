@@ -7,27 +7,36 @@ the HTTP layer belongs to the backend component. Mounted at
 
 Endpoints:
 - ``POST /crawl`` — fetch one URL synchronously, return the stored doc.
+- ``POST /wayback`` — fetch an archived site from the Wayback Machine.
 - ``GET /sites`` — the crawled sites, with counts.
+- ``POST /sites/{site}/assets`` — fetch the site's missing assets, as a job.
+- ``GET /sites/{site}/export`` — a site as a zip of plain files.
 - ``GET /pages`` — list recent pages, optionally for one site.
 - ``GET /pages/{page_id}`` — fetch a single stored page.
+- ``GET /pages/{page_id}/assets`` — the files that page references.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.db import get_async_db
+from app.services.crawler import queries
 from app.services.crawler.deps import get_crawler_service
-from app.services.crawler.dispatch import start_crawl
-from app.services.crawler.models import CrawledPage
+from app.services.crawler.dispatch import start_assets, start_crawl, start_wayback
+from app.services.crawler.export import export_site
+from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
     BatchCrawlRequest,
+    CrawledAssetRead,
     CrawledPageRead,
+    CrawledPageSummary,
     CrawlerSite,
     CrawlerStats,
     CrawlRequest,
+    WaybackRequest,
 )
 from app.services.crawler.service import CrawlerService
 
@@ -71,6 +80,15 @@ async def crawl_batch(payload: BatchCrawlRequest) -> JSONResponse:
     )
 
 
+@router.post("/wayback", status_code=status.HTTP_202_ACCEPTED)
+async def crawl_wayback(payload: WaybackRequest) -> JSONResponse:
+    """Fetch every archived page of a site, as a background job."""
+    job_id = await start_wayback(payload)
+    return JSONResponse(
+        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
+    )
+
+
 @router.get("/sites")
 async def list_sites(
     crawler: CrawlerService = Depends(get_crawler_service),
@@ -80,7 +98,30 @@ async def list_sites(
     return await crawler.sites(session)
 
 
-@router.get("/pages", response_model=list[CrawledPageRead])
+@router.post("/sites/{site}/assets", status_code=status.HTTP_202_ACCEPTED)
+async def site_assets(site: str) -> JSONResponse:
+    """Fetch every asset the site's stored pages name and do not have yet."""
+    job_id = await start_assets(site)
+    return JSONResponse(
+        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
+    )
+
+
+@router.get("/sites/{site}/export")
+async def export(
+    site: str,
+    session: AsyncSession = Depends(get_async_db),
+) -> Response:
+    """The site as a zip of plain files: pages, assets, a manifest."""
+    data = await export_site(session, site)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{site}.zip"'},
+    )
+
+
+@router.get("/pages", response_model=list[CrawledPageSummary])
 async def list_pages(
     limit: int = Query(default=50, ge=1, le=500),
     failed_only: bool = Query(default=False),
@@ -104,6 +145,15 @@ async def get_document(
     if document is None:
         raise HTTPException(status_code=404, detail="CrawledPage not found")
     return document
+
+
+@router.get("/pages/{page_id}/assets", response_model=list[CrawledAssetRead])
+async def page_assets(
+    page_id: int,
+    session: AsyncSession = Depends(get_async_db),
+) -> list[CrawledAsset]:
+    """The assets first seen on one stored page."""
+    return await queries.page_assets(session, page_id)
 
 
 @router.get("/stats")

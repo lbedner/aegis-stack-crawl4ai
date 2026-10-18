@@ -33,3 +33,14 @@ class CrawlerSettingsMixin(BaseSettings):
         default="aegis-stack-crawl4ai/0.1",
         description="User-Agent header sent on every request.",
     )
+    CRAWLER_ARCHIVE_DELAY_S: float = Field(
+        default=4.0,
+        description=(
+            "Seconds between requests to web.archive.org, which are made "
+            "one at a time; it throttles near fifteen a minute."
+        ),
+    )
+    CRAWLER_RETRY_LIMIT: int = Field(
+        default=3,
+        description="Retries after a 429 or 503, each waiting twice as long.",
+    )

@@ -120,13 +120,109 @@ class TestCrawlReturnsEveryPage:
         crawler._get_crawler = fake_get_crawler  # type: ignore[method-assign]
         crawler._store = fake_store  # type: ignore[method-assign]
 
-        await crawler.crawl(
+        async for _ in crawler.crawl(
             object(), url="https://a.test", options=CrawlOptions(depth=1)
-        )
+        ):
+            pass
 
         assert stored == ["https://a.test", "https://a.test/two"], (
             "the off-domain result should have been filtered out"
         )
+
+    @pytest.mark.asyncio
+    async def test_the_globs_keep_the_seed_and_judge_the_rest(self) -> None:
+        """Our rule, not crawl4ai's: the seed always lands, what it links
+        to passes the globs."""
+        crawler = CrawlerService()
+        stored: list[str] = []
+
+        class _Result:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.success = True
+                self.status_code = 200
+                self.markdown = "body"
+                self.html = "<p>body</p>"
+
+        async def fake_arun(**kwargs: Any) -> list[_Result]:
+            return [
+                _Result("https://a.test/"),
+                _Result("https://a.test/journal/x"),
+                _Result("https://a.test/guide/y"),
+            ]
+
+        class _Crawler:
+            arun = staticmethod(fake_arun)
+
+        async def fake_get_crawler() -> Any:
+            return _Crawler()
+
+        async def fake_store(_session: Any, result: Any, **_kw: Any) -> Any:
+            stored.append(result.url)
+            return result
+
+        crawler._get_crawler = fake_get_crawler  # type: ignore[method-assign]
+        crawler._store = fake_store  # type: ignore[method-assign]
+
+        async for _ in crawler.crawl(
+            object(),
+            url="https://a.test/",
+            options=CrawlOptions(depth=1, include=["*/journal/*"]),
+        ):
+            pass
+
+        assert stored == ["https://a.test/", "https://a.test/journal/x"]
+
+    def test_a_deep_crawl_streams(self) -> None:
+        """Pages are handed over as crawl4ai finds them, not as one list
+        at the end, so a 500-page crawl holds one page at a time."""
+        assert CrawlerService.run_config(CrawlOptions(depth=1)).stream is True
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_crawl_stores_each_page_as_it_arrives(self) -> None:
+        crawler = CrawlerService()
+        order: list[str] = []
+
+        class _Result:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.success = True
+                self.status_code = 200
+                self.markdown = "body"
+                self.html = "<p>body</p>"
+
+        async def fake_arun(**kwargs: Any) -> Any:
+            async def stream() -> Any:
+                for url in ("https://a.test/", "https://a.test/two"):
+                    order.append(f"found {url}")
+                    yield _Result(url)
+
+            return stream()
+
+        class _Crawler:
+            arun = staticmethod(fake_arun)
+
+        async def fake_get_crawler() -> Any:
+            return _Crawler()
+
+        async def fake_store(_session: Any, result: Any, **_kw: Any) -> Any:
+            order.append(f"stored {result.url}")
+            return result
+
+        crawler._get_crawler = fake_get_crawler  # type: ignore[method-assign]
+        crawler._store = fake_store  # type: ignore[method-assign]
+
+        async for _ in crawler.crawl(
+            object(), url="https://a.test/", options=CrawlOptions(depth=1)
+        ):
+            pass
+
+        assert order == [
+            "found https://a.test/",
+            "stored https://a.test/",
+            "found https://a.test/two",
+            "stored https://a.test/two",
+        ]
 
 
 class TestFailureStatus:

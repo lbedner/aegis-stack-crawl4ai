@@ -1,0 +1,51 @@
+{%- if include_worker %}
+"""With a worker in the stack, a crawl runs there, not in the webserver.
+
+The plugin ships its own queue, discovered like any other; the task takes
+JSON and hands the work to the jobs module. The webserver only records
+the job and enqueues it, so a restart there leaves the crawl running.
+"""
+
+from typing import Any
+
+import pytest
+
+from app.components.worker import registry
+from app.services.crawler import dispatch
+
+
+def test_the_crawler_queue_is_discovered_with_its_task() -> None:
+    assert "crawler" in registry.discover_worker_queues()
+    assert "crawl_task" in registry.queue_tasks("crawler")
+
+
+@pytest.mark.asyncio
+async def test_a_job_is_recorded_then_handed_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[tuple[str, str]] = []
+    enqueued: list[tuple[Any, ...]] = []
+
+    class _Store:
+        async def create(self, job_id: str, name: str, label: str) -> None:
+            created.append((job_id, name))
+
+        async def fail(self, job_id: str, error: str) -> None:
+            raise AssertionError(error)
+
+        async def aclose(self) -> None:
+            pass
+
+    async def fake_enqueue(task: str, queue: str, *args: Any) -> None:
+        enqueued.append((task, queue, *args))
+
+    monkeypatch.setattr(dispatch, "_store", lambda: _Store())
+    monkeypatch.setattr(dispatch, "_enqueue", fake_enqueue)
+
+    job_id = await dispatch.start_crawl(["https://a.test"])
+
+    assert created == [(job_id, "crawler-batch:1")]
+    task, queue, got_id, kind, payload = enqueued[0]
+    assert (task, queue, got_id, kind) == ("crawl_task", "crawler", job_id, "crawl")
+    assert payload["urls"] == ["https://a.test"]
+{%- endif %}

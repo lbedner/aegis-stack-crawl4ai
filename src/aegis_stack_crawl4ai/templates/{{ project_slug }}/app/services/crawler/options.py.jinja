@@ -6,6 +6,7 @@ ones the API, the CLI and the dashboard share. Everything else keeps
 crawl4ai's own default, which is the point of not wrapping all of it.
 """
 
+from fnmatch import fnmatch
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
@@ -52,6 +53,30 @@ class CrawlOptions(BaseModel):
         default=False,
         description="Bypass the cache and the store's dedup; always refetch.",
     )
+    assets: bool = Field(
+        default=False,
+        description="Also fetch each page's images, stylesheets, scripts and downloads.",
+    )
+    include: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Keep only URLs matching one of these globs; empty is all.",
+    )
+    exclude: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Drop URLs matching one of these globs.",
+    )
+
+    def allows(self, url: str) -> bool:
+        """Whether a URL passes the globs: in one of ``include`` (or none
+        given), and in none of ``exclude``. The one rule for the archive
+        listing and for what a deep crawl keeps."""
+        if any(fnmatch(url, pattern) for pattern in self.exclude):
+            return False
+        return not self.include or any(
+            fnmatch(url, pattern) for pattern in self.include
+        )
 
 
 def site_of(url: str) -> str | None:

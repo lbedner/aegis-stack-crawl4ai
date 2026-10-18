@@ -1,0 +1,122 @@
+{%- if include_worker %}
+{%- if worker_backend == "taskiq" %}
+"""The crawler queue (TaskIQ): one job per crawl, for as long as the
+crawl takes. A queue of its own, so an hour-long archive pull never
+holds a slot other jobs need; its concurrency is how many crawls run at
+once, and archive.org's turns are kept per process either way."""
+
+from typing import Any
+
+from taskiq_redis import RedisAsyncResultBackend
+
+from app.components.worker.broker import PausableRedisStreamBroker
+from app.components.worker.middleware import EventPublishMiddleware
+from app.core.config import settings
+
+QUEUE = "crawler"
+
+redis_url = settings.redis_url_effective
+
+broker = (
+    PausableRedisStreamBroker(
+        url=redis_url, queue_name=f"taskiq:{QUEUE}", consumer_id="0", xread_count=1
+    )
+    .with_result_backend(
+        RedisAsyncResultBackend(redis_url=redis_url, result_ex_time=60)
+    )
+    .with_middlewares(EventPublishMiddleware().set_queue_name(QUEUE))
+)
+
+
+@broker.task
+async def crawl_task(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one crawl job (``jobs.run_job``); progress lands in the shared
+    job store. No retry: a crawl delivered twice re-fetches nothing, but
+    it would wait the archive's turns again for nothing."""
+    from app.services.crawler.jobs import run_job
+
+    return await run_job(job_id, kind, payload)
+{%- elif worker_backend == "dramatiq" %}
+"""The crawler queue (Dramatiq): one job per crawl, for as long as the
+crawl takes. A queue of its own, so an hour-long archive pull never
+holds a slot other jobs need."""
+
+from typing import Any
+
+import dramatiq
+
+# The broker is initialised before any actor is registered.
+import app.components.worker.broker  # noqa: F401
+
+QUEUE = "crawler"
+
+# ponytail: Dramatiq always has a time limit (ten minutes by default); a
+# day stands in for none (an archive pull is as long as the archive is).
+A_DAY_MS = 24 * 60 * 60 * 1000
+
+
+@dramatiq.actor(queue_name=QUEUE, max_retries=0, time_limit=A_DAY_MS)
+async def crawl_task(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one crawl job (``jobs.run_job``); progress lands in the shared
+    job store."""
+    from app.services.crawler.jobs import run_job
+
+    return await run_job(job_id, kind, payload)
+{%- else %}
+"""The crawler queue (arq): one job per crawl, for as long as the crawl
+takes. A queue of its own, so an hour-long archive pull never holds a
+slot other jobs need; its concurrency is how many crawls run at once."""
+
+from typing import Any
+
+from arq.connections import RedisSettings
+
+from app.components.worker import arq_hooks
+from app.core.config import settings
+from app.core.queue_workers import concurrency_for
+
+QUEUE = "crawler"
+
+# ponytail: arq always has a job timeout; a day stands in for none (an
+# archive pull is as long as the archive is).
+A_DAY_SECONDS = 24 * 60 * 60
+
+
+async def crawl_task(
+    ctx: dict[str, Any], job_id: str, kind: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Run one crawl job (``jobs.run_job``); progress lands in the shared
+    job store."""
+    from app.services.crawler.jobs import run_job
+
+    return await run_job(job_id, kind, payload)
+
+
+class WorkerSettings:
+    """The crawler, one crawl per job."""
+
+    description = "The crawler, one crawl per job"
+    functions = [crawl_task]
+    base_settings = RedisSettings.from_dsn(settings.redis_url_effective)
+    redis_settings = RedisSettings(
+        host=base_settings.host,
+        port=base_settings.port,
+        database=base_settings.database,
+        password=base_settings.password,
+        conn_timeout=settings.REDIS_CONN_TIMEOUT,
+        conn_retries=settings.REDIS_CONN_RETRIES,
+        conn_retry_delay=settings.REDIS_CONN_RETRY_DELAY,
+    )
+    queue_name = f"arq:queue:{QUEUE}"
+    max_jobs = concurrency_for(QUEUE)  # Settings.WORKER_QUEUES
+    job_timeout = A_DAY_SECONDS
+    keep_result = settings.WORKER_KEEP_RESULT_SECONDS
+    # A crawl is never run twice: one the worker lost is failed, not resumed
+    # here; a re-run skips what was stored.
+    max_tries = 1
+    health_check_interval = settings.WORKER_HEALTH_CHECK_INTERVAL
+    on_startup, on_shutdown, on_job_start, after_job_end = arq_hooks.for_queue(
+        QUEUE, max_jobs
+    )
+{%- endif %}
+{%- endif %}

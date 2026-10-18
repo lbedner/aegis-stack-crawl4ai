@@ -1,0 +1,120 @@
+"""An archived site is listed from the CDX index, not crawled link by link.
+
+A deep crawl of a snapshot sees ``web.archive.org`` as the site and walks
+into the archive's chrome. The CDX index names every capture; the
+latest one in the window is fetched per page, and what the store already
+has is not fetched again.
+"""
+
+import json
+from typing import Any
+
+import httpx
+import pytest
+
+from app.services.crawler import archive, queries
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.wayback import choose, enumerate_site
+
+CDX = [
+    ["urlkey", "timestamp", "original"],
+    ["test,a)/", "20170101000000", "http://a.test/"],
+    ["test,a)/", "20190101000000", "http://a.test/"],
+    ["test,a)/", "20210101000000", "http://a.test/"],
+    ["test,a)/post", "20180101000000", "http://a.test/post"],
+    ["test,a)/backup.php?mbed=1", "20180601000000", "http://a.test/backup.php?Mbed=1"],
+]
+
+
+class TestChoose:
+    def test_the_latest_capture_per_page_wins(self) -> None:
+        assert choose(CDX[1:]) == {
+            "http://a.test/": "20210101000000",
+            "http://a.test/post": "20180101000000",
+            "http://a.test/backup.php?Mbed=1": "20180601000000",
+        }
+
+
+class TestPatterns:
+    @pytest.mark.parametrize(
+        ("url", "include", "exclude", "expected"),
+        [
+            ("http://a.test/post", [], [], True),
+            ("http://a.test/post", ["*/post*"], [], True),
+            ("http://a.test/other", ["*/post*"], [], False),
+            ("http://a.test/backup.php?Mbed=1", [], ["*backup.php*"], False),
+            ("http://a.test/post", ["*a.test*"], ["*backup*"], True),
+        ],
+    )
+    def test_allows(
+        self, url: str, include: list[str], exclude: list[str], expected: bool
+    ) -> None:
+        assert CrawlOptions(include=include, exclude=exclude).allows(url) is expected
+
+
+@pytest.mark.asyncio
+async def test_enumerate_lists_snapshot_urls_in_the_window() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, text=json.dumps(CDX))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        urls = await enumerate_site(
+            "a.test",
+            to_ts="20191231",
+            options=CrawlOptions(exclude=["*backup.php*"]),
+            client=client,
+        )
+
+    assert seen[0]["url"] == "a.test"
+    assert seen[0]["to"] == "20191231"
+    assert seen[0]["collapse"] == "digest"
+    assert urls == [
+        "https://web.archive.org/web/20210101000000/http://a.test/",
+        "https://web.archive.org/web/20180101000000/http://a.test/post",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pages_already_stored_are_not_fetched_again(
+    async_db_session: Any,
+) -> None:
+    for url, status in (("http://a.test/", 200), ("http://a.test/post", 404)):
+        async_db_session.add(
+            CrawledPage(source_url=url, site="a.test", status_code=status)
+        )
+    await async_db_session.commit()
+
+    stored = await queries.stored_ok_urls(
+        async_db_session,
+        ["http://a.test/", "http://a.test/post", "http://a.test/new"],
+    )
+
+    assert stored == {"http://a.test/"}
+
+
+@pytest.mark.asyncio
+async def test_a_listing_waits_out_the_archive_being_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The index answers 503 when it is busy; that is a pause, not a miss."""
+    answers = [503, 503, 200]
+    naps: list[float] = []
+    archive._not_before.clear()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        status = answers.pop(0)
+        return httpx.Response(status, text=json.dumps(CDX) if status == 200 else "")
+
+    async def fake_sleep(seconds: float) -> None:
+        naps.append(seconds)
+
+    monkeypatch.setattr(archive.asyncio, "sleep", fake_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        urls = await enumerate_site("a.test", client=client)
+
+    assert len(urls) == 3
+    assert len(naps) == 2 and naps[1] > naps[0]

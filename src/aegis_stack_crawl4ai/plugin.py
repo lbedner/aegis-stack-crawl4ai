@@ -47,18 +47,19 @@ def get_spec() -> PluginSpec:
         description="Web crawling and scraping via Crawl4AI",
         version="0.1.0",
         verified=False,
-        # PEP 440 specifier — the spec declares no tables (a revision is
-        # derived from the model), which the CLI only understands from
-        # 0.12 on. 0.13.1 is where the generated card-render test stops
-        # failing on a plugin's card, so anything older installs and then
-        # hands the user a red ``make check``.
-        aegis_version=">=0.13.1",
+        # PEP 440 specifier. The plugin's worker queue is written in the
+        # 0.15 shape (``arq_hooks.for_queue``, ``concurrency_for``, the
+        # pausable TaskIQ broker), so anything older imports a queue
+        # module that fails on the first line.
+        aegis_version=">=0.15.1",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.
         cli_name="crawl",
         # Resolver auto-installs database if missing.
         required_components=["database"],
+        # With a worker, crawls run there and survive a webserver restart.
+        recommended_components=["worker"],
         # Pinned to >=0.8.6 because 0.8.6 is the supply-chain hotfix
         # that swapped the compromised ``litellm`` package out — earlier
         # 0.8.x builds pull the bad transitive dep.
@@ -97,11 +98,17 @@ def get_spec() -> PluginSpec:
                 "app/components/frontend/dashboard/modals/crawler_pages_tab.py",
                 "app/components/frontend/dashboard/modals/crawler_crawl_tab.py",
                 "app/cli/crawl.py",
+                "app/components/worker/queues/crawler.py",
+                "tests/services/test_crawler_archive.py",
+                "tests/services/test_crawler_assets.py",
+                "tests/services/test_crawler_export.py",
                 "tests/services/test_crawler_jobs.py",
                 "tests/services/test_crawler_layout.py",
                 "tests/services/test_crawler_options.py",
                 "tests/services/test_crawler_sites.py",
+                "tests/services/test_crawler_wayback.py",
                 "tests/services/test_crawler_wiring.py",
+                "tests/services/test_crawler_worker.py",
                 "tests/components/frontend/test_crawler_tab.py",
             ]
         ),

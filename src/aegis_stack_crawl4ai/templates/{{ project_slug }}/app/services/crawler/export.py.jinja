@@ -1,0 +1,115 @@
+"""A crawled site as plain files.
+
+The store lives in a stack's database, and stacks are disposable. The
+export is the site as a folder, zipped so it can cross the API: each
+page's HTML and markdown at its URL path, each asset at its own path,
+and a ``manifest.json`` naming them all with URL, snapshot timestamp,
+hash and content type. A rebuild starts from the folder, not the
+database.
+
+ponytail: the zip is built in memory and returned whole, fine for a
+personal site; a spooled temp file and a streaming response if a site
+ever runs to gigabytes.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+from typing import Any
+from urllib.parse import urlsplit
+
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.core.log import logger
+from app.core.storage import get_storage
+from app.services.crawler import queries
+from app.services.crawler.options import site_of
+from app.services.crawler.schemas import CrawledAssetRead, CrawledPageSummary
+
+MANIFEST = "manifest.json"
+_PAGE_SUFFIXES = (".htm", ".html")
+
+
+def file_path(url: str, site: str | None = None) -> str:
+    """The URL's path inside the folder: its own path, ``index`` for a
+    directory, the query kept so ``?p=2`` and ``?p=3`` stay two files,
+    another host of the site under its own name, and nothing that could
+    climb out of the folder."""
+    parts = urlsplit(url)
+    segments = [s for s in parts.path.split("/") if s not in ("", ".", "..")]
+    name = "/".join(segments)
+    if not segments or parts.path.endswith("/"):
+        name = f"{name}/index" if name else "index"
+    if parts.query:
+        name = f"{name}?{parts.query}"
+    host = site_of(url)
+    if site and host and host != site:
+        name = f"{host}/{name}"
+    return name
+
+
+def _page_paths(url: str) -> tuple[str, str]:
+    """Where a page's HTML and markdown go."""
+    name = file_path(url)
+    stem, dot, suffix = name.rpartition(".")
+    if dot and f".{suffix}".lower() in _PAGE_SUFFIXES:
+        return name, f"{stem}.md"
+    return f"{name}.html", f"{name}.md"
+
+
+class _Folder:
+    """The zip, refusing to write one path twice: a collision is logged
+    and skipped, never a silent overwrite."""
+
+    def __init__(self, buffer: io.BytesIO) -> None:
+        self.archive = zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED)
+        self.names: set[str] = set()
+
+    def write(self, path: str, data: bytes | str, *, compress: bool = True) -> bool:
+        if path in self.names:
+            logger.warning("crawler.export collision path=%s", path)
+            return False
+        self.names.add(path)
+        self.archive.writestr(
+            path, data, zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+        )
+        return True
+
+
+async def export_site(session: AsyncSession, site: str) -> bytes:
+    """The site's latest successful fetch of every page, its stored
+    assets, and the manifest, as one zip."""
+    storage = get_storage()
+    buffer = io.BytesIO()
+    manifest: dict[str, Any] = {"site": site, "pages": [], "assets": [], "missing": []}
+    folder = _Folder(buffer)
+    with folder.archive:
+        for page in await queries.site_pages(session, site):
+            html, markdown = _page_paths(page.source_url)
+            if folder.write(html, page.html or "") and folder.write(
+                markdown, page.content or ""
+            ):
+                entry = CrawledPageSummary.model_validate(page).model_dump(
+                    mode="json", exclude={"content"}
+                )
+                manifest["pages"].append({**entry, "html": html, "markdown": markdown})
+        for asset in await queries.site_assets(session, site):
+            data = await storage.get(str(asset.storage_key))
+            if data is None:
+                logger.warning(
+                    "crawler.export missing url=%s key=%s",
+                    asset.original_url,
+                    asset.storage_key,
+                )
+                manifest["missing"].append(asset.original_url)
+                continue
+            path = file_path(asset.original_url, site)
+            # Images and archives are already compressed; deflating them
+            # costs CPU for nothing.
+            if folder.write(path, data, compress=False):
+                entry = CrawledAssetRead.model_validate(asset).model_dump(mode="json")
+                manifest["assets"].append({**entry, "path": path})
+        folder.write(MANIFEST, json.dumps(manifest, indent=2))
+    return buffer.getvalue()

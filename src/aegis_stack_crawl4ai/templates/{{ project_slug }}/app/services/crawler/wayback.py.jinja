@@ -1,0 +1,86 @@
+"""Listing an archived site from the Wayback Machine's CDX index.
+
+A deep crawl of a snapshot sees ``web.archive.org`` as the site and
+walks into the archive's own chrome. The CDX index names every capture
+of a domain in one request, so the site is listed from it and each page
+is fetched once, at its latest capture inside the window.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import httpx
+
+from app.services.crawler.archive import (
+    ARCHIVE_HOST,
+    THROTTLED,
+    http_client,
+    patiently,
+    snapshot_url,
+)
+from app.services.crawler.options import CrawlOptions
+
+CDX_URL = f"https://{ARCHIVE_HOST}/cdx/search/cdx"
+
+
+def choose(rows: Iterable[list[str]]) -> dict[str, str]:
+    """The latest capture per page, as ``original -> timestamp``.
+
+    Rows are ``[urlkey, timestamp, original]``: the urlkey is the
+    archive's canonical form, so ``www`` and scheme variants collapse to
+    one page, and the original of the chosen capture is the one kept.
+    """
+    latest: dict[str, tuple[str, str]] = {}
+    for urlkey, ts, original in rows:
+        if urlkey not in latest or ts > latest[urlkey][0]:
+            latest[urlkey] = (ts, original)
+    return {original: ts for ts, original in latest.values()}
+
+
+async def _cdx_rows(
+    client: httpx.AsyncClient, params: list[tuple[str, str]]
+) -> list[list[str]]:
+    """The index's rows, in the archive's turn like any other request."""
+    response = await patiently(
+        ARCHIVE_HOST,
+        lambda: client.get(CDX_URL, params=params),
+        lambda r: r.status_code in THROTTLED,
+    )
+    response.raise_for_status()
+    return response.json() or []
+
+
+async def enumerate_site(
+    domain: str,
+    *,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    options: CrawlOptions | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> list[str]:
+    """Snapshot URLs for every HTML page of ``domain`` captured in the window.
+
+    One CDX request, successful HTML captures only, subdomains included,
+    runs of identical content collapsed. The ``wayback/available``
+    endpoint is not asked: it answers empty for sites the index lists in
+    full.
+    """
+    options = options or CrawlOptions()
+    params = [
+        ("url", domain),
+        ("matchType", "domain"),
+        ("output", "json"),
+        ("fl", "urlkey,timestamp,original"),
+        ("filter", "statuscode:200"),
+        ("filter", "mimetype:text/html"),
+        ("collapse", "digest"),
+    ]
+    params += [(key, ts) for key, ts in (("from", from_ts), ("to", to_ts)) if ts]
+    async with http_client(client, timeout_factor=4) as http:
+        rows = await _cdx_rows(http, params)
+    return [
+        snapshot_url(ts, original)
+        for original, ts in choose(rows[1:]).items()
+        if options.allows(original)
+    ]

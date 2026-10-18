@@ -8,6 +8,9 @@ documented promise that silently does nothing, and someone tunes it in
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from typing import Any
+
 import pytest
 
 from app.core.config import settings
@@ -31,9 +34,10 @@ class TestDeclaredSettingsAreRead:
         seen: list[int] = []
 
         class _Counting(CrawlerService):
-            async def crawl(self, *args: object, **kwargs: object) -> list:
+            async def crawl(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
                 seen.append(1)
-                return []
+                return
+                yield
 
         service = _Counting()
         assert service.concurrency() == settings.CRAWLER_MAX_CONCURRENCY

@@ -13,7 +13,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = ["aegis-stack", "aegis-stack-plugin", "crawl4ai", "web-crawling"]
 dependencies = [
-    "aegis-stack>=0.13.1",
+    "aegis-stack>=0.15.1",
 ]
 
 [project.urls]

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,6 +36,8 @@ from app.core.config import settings
 from app.core.log import logger
 from app.core.storage import content_key
 from app.services.crawler import queries
+from app.services.crawler.assets import fetch_assets
+from app.services.crawler.archive import THROTTLED, paced, patiently, resolve
 from app.services.crawler.models import CrawledPage
 from app.services.crawler.options import CrawlOptions, same_site, site_of
 from app.services.crawler.schemas import CrawlerSite, CrawlerStats
@@ -56,6 +58,26 @@ def _status_from_error(message: str | None) -> int | None:
     """The HTTP status buried in a crawl4ai error message, if it is one."""
     match = _STATUS_IN_ERROR.search(message or "")
     return int(match.group(1)) if match else None
+
+
+async def _each(outcome: Any) -> AsyncIterator[Any]:
+    """One result, a list of them, or a stream of them, as a stream."""
+    if hasattr(outcome, "__aiter__"):
+        async for result in outcome:
+            yield result
+        return
+    for result in outcome if isinstance(outcome, list) else [outcome]:
+        yield result
+
+
+def _throttled(outcome: Any) -> bool:
+    """Whether the host asked for a pause; a deep crawl's stream never does."""
+    if not hasattr(outcome, "success") or getattr(outcome, "success", False):
+        return False
+    status = getattr(outcome, "status_code", None) or _status_from_error(
+        getattr(outcome, "error_message", None)
+    )
+    return status in THROTTLED
 
 
 def _page_metadata(result: Any) -> dict[str, Any]:
@@ -154,27 +176,12 @@ class CrawlerService:
         ``WHERE status_code >= 400 OR status_code IS NULL`` is the
         unfetched-or-failed set.
 
-        ``fresh`` controls whether to bypass both crawl4ai's network
-        cache and our row-level dedup:
-
-        - ``False`` (default, fast path): use crawl4ai's
-          ``CacheMode.ENABLED`` so repeat fetches of the same URL
-          skip the network, AND row-dedup against the most recent
-          successful fetch's content hash so identical content
-          doesn't write a duplicate row. Same URL twice in a row →
-          no network call, no insert.
-        - ``True`` (force): pass ``CacheMode.BYPASS`` to crawl4ai
-          (always hit the network) and skip row dedup (always insert).
-          Use this for write-history semantics or when you suspect
-          the cached body is stale.
+        ``fresh`` bypasses both crawl4ai's network cache and the row-level
+        dedup, so the URL is always fetched and always written; the
+        default skips the network on a cache hit and the insert when the
+        body hashed the same as the last successful fetch.
         """
-        crawler = await self._get_crawler()
-        options = CrawlOptions(fresh=fresh)
-        # crawl4ai wraps ``arun`` in a decorator whose annotation reads as an
-        # unbound-or-bound union to the type checker; the call is correct.
-        result = await crawler.arun(  # ty: ignore[missing-argument]
-            url=url, config=self.run_config(options)
-        )
+        result = await self._run(url, CrawlOptions(fresh=fresh))
         return await self._store(
             session,
             result,
@@ -199,6 +206,9 @@ class CrawlerService:
             word_count_threshold=options.min_words or 1,
             # crawl4ai counts in milliseconds; the setting is in seconds.
             page_timeout=settings.CRAWLER_DEFAULT_TIMEOUT_S * 1000,
+            # A deep crawl hands pages over as it finds them, one in
+            # memory at a time, rather than the whole list at the end.
+            stream=options.depth > 0,
         )
         if options.depth > 0:
             from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
@@ -218,38 +228,59 @@ class CrawlerService:
         options: CrawlOptions | None = None,
         doc_metadata: dict[str, Any] | None = None,
         source_kind: str = "crawl4ai",
-    ) -> list[CrawledPage]:
-        """Fetch ``url`` and, when depth asks for it, what it links to.
+    ) -> AsyncIterator[CrawledPage]:
+        """Fetch ``url`` and, when depth asks for it, what it links to,
+        yielding each page as it is stored.
 
-        A deep crawl makes ``arun`` return a list rather than one
-        result, so this is the shape every caller that might follow
-        links has to speak. ``stay_on_domain`` is enforced here as well
-        as passed down: the guarantee shown in the UI is ours to keep.
+        A deep crawl streams results; a single fetch is one. Either way
+        a page is stored and handed over before the next is fetched, so
+        memory holds one page, not a site. ``stay_on_domain`` is enforced
+        here as well as passed down: the guarantee shown in the UI is
+        ours to keep.
         """
         options = options or CrawlOptions()
-        crawler = await self._get_crawler()
-        outcome = await crawler.arun(  # ty: ignore[missing-argument]
-            url=url, config=self.run_config(options)
-        )
-        results = outcome if isinstance(outcome, list) else [outcome]
-
-        pages: list[CrawledPage] = []
-        for result in results:
-            found = str(getattr(result, "url", "") or url)
-            if options.stay_on_domain and not same_site(url, found):
-                logger.debug("crawler.crawl.offsite url=%s seed=%s", found, url)
+        outcome = await self._run(url, options)
+        seed = resolve(url).url
+        async for result in _each(outcome):
+            found = resolve(str(getattr(result, "url", "") or url)).url
+            offsite = options.stay_on_domain and not same_site(seed, found)
+            if offsite or (found != seed and not options.allows(found)):
+                logger.debug("crawler.crawl.skipped url=%s seed=%s", found, url)
                 continue
-            pages.append(
-                await self._store(
-                    session,
-                    result,
-                    url=found,
-                    doc_metadata=doc_metadata,
-                    source_kind=source_kind,
-                    fresh=options.fresh,
-                )
+            page = await self._store(
+                session,
+                result,
+                url=found,
+                doc_metadata=doc_metadata,
+                source_kind=source_kind,
+                fresh=options.fresh,
             )
-        return pages
+            if options.assets:
+                await fetch_assets(session, page)
+            yield page
+
+    async def _run(self, url: str, options: CrawlOptions) -> Any:
+        """One crawl4ai run, for every fetch path: a snapshot goes on the
+        wire raw, the host gets its turn, and a throttle is waited out
+        and retried rather than stored as a failed page."""
+        crawler = await self._get_crawler()
+        fetch_url = resolve(url).fetch_url
+        host = site_of(fetch_url) or ""
+        if options.depth and paced(host):
+            # A streamed deep crawl fetches inside crawl4ai, outside the
+            # host's turns, so the archive's pace could not be kept.
+            raise ValueError(
+                f"{host} is paced; list the site with `crawl wayback` "
+                "instead of a deep crawl"
+            )
+        config = self.run_config(options)
+        return await patiently(
+            host,
+            # crawl4ai wraps ``arun`` in a decorator whose annotation reads
+            # as an unbound-or-bound union to the type checker.
+            lambda: crawler.arun(url=fetch_url, config=config),  # ty: ignore[missing-argument]
+            _throttled,
+        )
 
     async def _store(
         self,
@@ -262,15 +293,19 @@ class CrawlerService:
         fresh: bool = False,
     ) -> CrawledPage:
         """One crawl4ai result, persisted. Shared by every fetch path."""
+        target = resolve(url)
+        url = target.url
+        source_kind = target.source_kind or source_kind
         content: str | None = None
+        html: str | None = None
         content_type = "html"
         status_code: int | None = None
 
         if getattr(result, "success", False):
-            content = (
-                getattr(result, "markdown", None)
-                or getattr(result, "html", None)
-            )
+            # The markdown is what the dashboard reads; the HTML is what
+            # a rebuild reads.
+            html = getattr(result, "html", None) or None
+            content = getattr(result, "markdown", None) or html
             if getattr(result, "markdown", None):
                 content_type = "markdown"
             status_code = getattr(result, "status_code", 200) or 200
@@ -308,15 +343,23 @@ class CrawlerService:
                     status="success",
                     details=f"hash match → returning row #{existing.id}",
                 )
+                # The lookup opened a transaction; end it, or the connection
+                # sits idle in it through the next fetch's waits.
+                await session.rollback()
                 return existing
 
         document = CrawledPage(
             source_url=url,
             site=site_of(url),
             content=content,
+            html=html,
             content_hash=new_hash,
             content_type=content_type,
-            doc_metadata={**_page_metadata(result), **(doc_metadata or {})},
+            doc_metadata={
+                **_page_metadata(result),
+                **target.doc_metadata,
+                **(doc_metadata or {}),
+            },
             status_code=status_code,
             source_kind=source_kind,
             fetched_at=datetime.now(UTC),
@@ -350,47 +393,59 @@ class CrawlerService:
         options: CrawlOptions | None = None,
         source_kind: str = "crawl4ai",
         max_concurrency: int | None = None,
-        report: Callable[[str], None] | None = None,
-    ) -> list[CrawledPage]:
-        """Concurrent fetch of many URLs.
+    ) -> AsyncIterator[CrawledPage]:
+        """Concurrent fetch of many URLs, yielding each page as it lands.
 
-        ``session_factory`` is an ``async_sessionmaker`` (not a session)
-        — each fetch opens its own session/transaction so a single
-        failed write doesn't roll back its peers. ``doc_metadata_for``
-        maps URL → tags; URLs without entries get an empty dict.
-
-        ``report`` is called once per URL as it lands, which is what the
-        job's SSE stream carries: a crawl that has stalled on one slow
-        host looks stalled instead of silent.
-
-        ``max_concurrency`` defaults to ``CRAWLER_MAX_CONCURRENCY``.
+        ``session_factory`` is an ``async_sessionmaker`` (not a session):
+        each seed opens its own session so a single failed write does
+        not roll back its peers. ``doc_metadata_for`` maps URL to tags;
+        URLs without entries get an empty dict. Pages come out in the
+        order they finish, so nothing waits for the slowest host and
+        nothing piles up. ``max_concurrency`` defaults to
+        ``CRAWLER_MAX_CONCURRENCY``.
         """
         options = options or CrawlOptions()
-        sem = asyncio.Semaphore(self.concurrency(max_concurrency))
+        width = self.concurrency(max_concurrency)
+        sem = asyncio.Semaphore(width)
         meta_map = doc_metadata_for or {}
-        total = len(urls)
-        done = 0
+        # Bounded, so a slow reader holds producers rather than pages.
+        landed: asyncio.Queue[CrawledPage | None] = asyncio.Queue(maxsize=width)
 
-        async def _one(url: str) -> list[CrawledPage]:
-            nonlocal done
-            async with sem:
-                async with session_factory() as session:
-                    pages = await self.crawl(
-                        session,
-                        url=url,
-                        options=options,
-                        doc_metadata=meta_map.get(url, {}),
-                        source_kind=source_kind,
-                    )
-            done += 1
-            if report is not None:
-                # Depth turns one URL into many pages, so say both.
-                found = f" ({len(pages)} pages)" if len(pages) != 1 else ""
-                report(f"Fetched {done} of {total}{found}")
-            return pages
+        async def _one(url: str) -> None:
+            async with sem, session_factory() as session:
+                async for page in self.crawl(
+                    session,
+                    url=url,
+                    options=options,
+                    doc_metadata=meta_map.get(url, {}),
+                    source_kind=source_kind,
+                ):
+                    await landed.put(page)
 
-        batches = await asyncio.gather(*(_one(u) for u in urls))
-        return [page for batch in batches for page in batch]
+        async def _all() -> None:
+            # Every seed runs to its end; one that raises does not stop its
+            # peers, and is raised once they are done so the job says why.
+            try:
+                outcomes = await asyncio.gather(
+                    *(_one(u) for u in urls), return_exceptions=True
+                )
+            finally:
+                await landed.put(None)
+            for url, outcome in zip(urls, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    logger.error("crawler.seed failed url=%s error=%s", url, outcome)
+            failed = [o for o in outcomes if isinstance(o, BaseException)]
+            if failed:
+                raise failed[0]
+
+        seeds = asyncio.create_task(_all())
+        try:
+            while (page := await landed.get()) is not None:
+                yield page
+            await seeds
+        finally:
+            seeds.cancel()
+            await asyncio.gather(seeds, return_exceptions=True)
 
     async def sites(self, session: AsyncSession) -> list[CrawlerSite]:
         """Every crawled site with its page and failure counts."""
