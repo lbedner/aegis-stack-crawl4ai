@@ -7,7 +7,10 @@ about a case it can obviously resolve, so it resolves it here, once, on
 the way into every request model.
 """
 
+from urllib.parse import urlsplit, urlunsplit
+
 _SCHEMES = ("http://", "https://")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def normalize_url(raw: str) -> str:
@@ -25,3 +28,24 @@ def normalize_url(raw: str) -> str:
         # Some other scheme entirely (ftp, file). Let the URL type judge it.
         return candidate
     return f"https://{candidate}"
+
+
+def canonical_url(url: str) -> str:
+    """One spelling per page: lowercase host, no default port, ``/`` for
+    an empty path. The form ``HttpUrl`` produces, so a row filed from a
+    CDX listing (``http://host:80/x``) and one from a live crawl agree."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.hostname:
+        return url
+    host = parts.hostname.lower()
+    if parts.port and parts.port != _DEFAULT_PORTS.get(parts.scheme.lower()):
+        host = f"{host}:{parts.port}"
+    if parts.username:
+        auth = parts.username + (f":{parts.password}" if parts.password else "")
+        host = f"{auth}@{host}"
+    return urlunsplit(
+        (parts.scheme.lower(), host, parts.path or "/", parts.query, parts.fragment)
+    )

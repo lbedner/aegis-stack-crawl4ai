@@ -10,11 +10,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import ColumnElement, and_, case, func, not_, or_
+from sqlalchemy.orm import defer
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.services.crawler.models import CrawledPage
+from app.services.crawler.models import CrawledAsset, CrawledPage
 
 _FAILED = or_(
     CrawledPage.status_code.is_(None),
@@ -23,6 +24,8 @@ _FAILED = or_(
 """A fetch that produced nothing usable. Shared so the stats, the
 per-site counts and the retry queue cannot drift apart on what
 "failed" means."""
+
+_IN_CHUNK = 900
 
 
 async def page_with_hash(
@@ -44,6 +47,60 @@ async def page_with_hash(
     ).first()
 
 
+_ASSET_SETTLED = or_(
+    CrawledAsset.storage_key.is_not(None),
+    and_(
+        CrawledAsset.status_code >= 400,
+        CrawledAsset.status_code < 500,
+        CrawledAsset.status_code != 429,
+    ),
+)
+"""An asset the store holds, or one the host definitely has not got.
+A throttle or an outage is neither, so it gets asked for again."""
+
+
+async def _present(
+    db: AsyncSession, column: Any, urls: list[str], *where: ColumnElement[bool]
+) -> set[str]:
+    """Which of ``urls`` have a row matching ``where``, by ``column``.
+
+    One ``IN`` query per chunk of URLs rather than one per URL; chunked
+    because SQLite caps bound parameters at 999 on older builds.
+    """
+    found: set[str] = set()
+    for start in range(0, len(urls), _IN_CHUNK):
+        rows = await db.exec(
+            select(column).where(column.in_(urls[start : start + _IN_CHUNK]), *where)
+        )
+        found.update(str(url) for url in rows.all())
+    return found
+
+
+async def stored_ok_urls(db: AsyncSession, urls: list[str]) -> set[str]:
+    """Which of ``urls`` the store already holds a successful fetch of."""
+    return await _present(db, CrawledPage.source_url, urls, not_(_FAILED))
+
+
+async def stored_asset_urls(db: AsyncSession, site: str, urls: list[str]) -> set[str]:
+    """Which of ``urls`` the site already has settled, held or a definite miss."""
+    return await _present(
+        db, CrawledAsset.original_url, urls, CrawledAsset.site == site, _ASSET_SETTLED
+    )
+
+
+async def page_assets(db: AsyncSession, page_id: int) -> list[CrawledAsset]:
+    """The assets first seen on one page."""
+    return list(
+        (
+            await db.exec(
+                select(CrawledAsset)
+                .where(CrawledAsset.page_id == page_id)
+                .order_by(CrawledAsset.id)
+            )
+        ).all()
+    )
+
+
 async def recent_pages(
     db: AsyncSession,
     *,
@@ -51,8 +108,14 @@ async def recent_pages(
     failed_only: bool = False,
     site: str | None = None,
 ) -> list[CrawledPage]:
-    """The most recent N pages, newest first."""
-    stmt = select(CrawledPage).order_by(CrawledPage.fetched_at.desc()).limit(limit)
+    """The most recent N pages, newest first, without their HTML: a
+    listing is a summary, and five hundred bodies is a lot to discard."""
+    stmt = (
+        select(CrawledPage)
+        .options(defer(CrawledPage.html))
+        .order_by(CrawledPage.fetched_at.desc())
+        .limit(limit)
+    )
     if site:
         stmt = stmt.where(CrawledPage.site == site)
     if failed_only:
@@ -110,3 +173,42 @@ async def content_type_counts(db: AsyncSession) -> dict[str, int]:
         )
     )
     return {str(name or "unknown"): int(count) for name, count in rows.all()}
+
+
+def _newest(model: Any, key: Any, *where: ColumnElement[bool]) -> Any:
+    """The id of the newest row per ``key``: the tables are append logs,
+    and rows land in fetch order, so the highest id is the latest."""
+    return select(func.max(model.id)).where(*where).group_by(key)
+
+
+async def site_pages(db: AsyncSession, site: str) -> list[CrawledPage]:
+    """Every page of a site, its latest successful fetch only, by URL.
+
+    Only the newest row per URL leaves the database; the stale bodies
+    of earlier fetches are never loaded.
+    """
+    newest = _newest(
+        CrawledPage, CrawledPage.source_url, CrawledPage.site == site, not_(_FAILED)
+    )
+    rows = await db.exec(
+        select(CrawledPage)
+        .where(CrawledPage.id.in_(newest))
+        .order_by(CrawledPage.source_url)
+    )
+    return list(rows.all())
+
+
+async def site_assets(db: AsyncSession, site: str) -> list[CrawledAsset]:
+    """Every stored asset of a site, by URL."""
+    newest = _newest(
+        CrawledAsset,
+        CrawledAsset.original_url,
+        CrawledAsset.site == site,
+        CrawledAsset.storage_key.is_not(None),
+    )
+    rows = await db.exec(
+        select(CrawledAsset)
+        .where(CrawledAsset.id.in_(newest))
+        .order_by(CrawledAsset.original_url)
+    )
+    return list(rows.all())

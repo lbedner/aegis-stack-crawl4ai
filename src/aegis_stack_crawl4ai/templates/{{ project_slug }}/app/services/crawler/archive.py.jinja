@@ -1,0 +1,154 @@
+"""Wayback Machine snapshots, and the manners archive.org asks for.
+
+``web.archive.org/web/<ts>/<url>`` serves the page with a toolbar and
+every link rewritten to the archive; the ``id_`` form serves the
+original bytes. So a snapshot is fetched in its ``id_`` form and stored
+under the original URL, with the timestamp kept beside it: the archive
+is a way to reach a site, not a site of its own.
+
+archive.org throttles near fifteen requests a minute. Its turns are kept
+here, process-wide, so every job and every request in the process waits
+for the same clock, and a 429 or 503 pushes that clock out for all of
+them rather than being stored as a failed page.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
+
+import httpx
+
+from app.core.config import settings
+from app.core.log import logger
+from app.services.crawler.urls import canonical_url
+
+ARCHIVE_HOST = "web.archive.org"
+SOURCE_KIND = "wayback"
+
+THROTTLED = frozenset({429, 503})
+"""The host asked for a pause, not a different page."""
+
+_SNAPSHOT = re.compile(
+    r"^https?://web\.archive\.org/web/(?P<ts>\d{4,14})(?:[a-z]{2}_)?/"
+    r"(?P<original>https?://.+)$"
+)
+
+T = TypeVar("T")
+
+_turns: dict[str, asyncio.Lock] = {}
+_not_before: dict[str, float] = {}
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where a fetch goes on the wire, and what the row is filed under."""
+
+    fetch_url: str
+    url: str
+    doc_metadata: dict[str, Any] = field(default_factory=dict)
+    source_kind: str | None = None
+
+
+def snapshot_url(ts: str, original: str, flag: str = "") -> str:
+    """A snapshot URL; ``flag="id_"`` is the raw form, original bytes only."""
+    return f"https://{ARCHIVE_HOST}/web/{ts}{flag}/{original}"
+
+
+def resolve(url: str) -> Target:
+    """A snapshot as the page it archived; anything else as itself.
+
+    The filed URL is canonical either way, so the archive copy and a live
+    crawl of one page land under one ``source_url``.
+    """
+    match = _SNAPSHOT.match(url)
+    if match is None:
+        return Target(fetch_url=url, url=canonical_url(url))
+    ts, original = match.group("ts"), match.group("original")
+    return Target(
+        fetch_url=snapshot_url(ts, original, "id_"),
+        url=canonical_url(original),
+        doc_metadata={"snapshot_ts": ts, "archive_url": url},
+        source_kind=SOURCE_KIND,
+    )
+
+
+def backoff(attempt: int) -> float:
+    """Seconds to wait after the n-th throttled answer: the archive's
+    pause, doubling each time."""
+    return max(settings.CRAWLER_ARCHIVE_DELAY_S, 1.0) * 2**attempt
+
+
+def _delay(host: str) -> float:
+    return settings.CRAWLER_ARCHIVE_DELAY_S if host == ARCHIVE_HOST else 0.0
+
+
+def paced(host: str) -> bool:
+    """Whether requests to this host take turns."""
+    return _delay(host) > 0
+
+
+@asynccontextmanager
+async def turn(host: str) -> AsyncIterator[None]:
+    """A paced host is one request at a time, a pause apart, process-wide."""
+    delay = _delay(host)
+    if not delay:
+        yield
+        return
+    async with _turns.setdefault(host, asyncio.Lock()):
+        due = _not_before.get(host, 0.0) - time.monotonic()
+        if due > 0:
+            await asyncio.sleep(due)
+        try:
+            yield
+        finally:
+            _not_before[host] = max(
+                _not_before.get(host, 0.0), time.monotonic() + delay
+            )
+
+
+async def patiently(
+    host: str, call: Callable[[], Awaitable[T]], throttled: Callable[[T], bool]
+) -> T:
+    """``call`` in the host's turn, retried when the host asks for a pause.
+
+    On a paced host the pause moves the shared clock, so every waiter
+    honours it; elsewhere this task alone sleeps. The last answer is
+    returned as it came, so a host that stays busy is a stored failure.
+    """
+    last = settings.CRAWLER_RETRY_LIMIT
+    for attempt in range(last + 1):
+        async with turn(host):
+            outcome = await call()
+            if not throttled(outcome) or attempt == last:
+                return outcome
+            wait = backoff(attempt)
+            logger.info("crawler.throttled host=%s wait=%.0fs", host, wait)
+            if _delay(host):
+                _not_before[host] = max(
+                    _not_before.get(host, 0.0), time.monotonic() + wait
+                )
+        if not _delay(host):
+            await asyncio.sleep(wait)
+    return outcome
+
+
+@asynccontextmanager
+async def http_client(
+    client: httpx.AsyncClient | None = None, *, timeout_factor: float = 1.0
+) -> AsyncIterator[httpx.AsyncClient]:
+    """The caller's client, or one of our own for the block: the crawler's
+    User-Agent and timeout, closed on the way out."""
+    if client is not None:
+        yield client
+        return
+    async with httpx.AsyncClient(
+        timeout=settings.CRAWLER_DEFAULT_TIMEOUT_S * timeout_factor,
+        headers={"User-Agent": settings.CRAWLER_USER_AGENT},
+    ) as owned:
+        yield owned

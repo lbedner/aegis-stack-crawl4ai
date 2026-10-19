@@ -1,27 +1,19 @@
-"""
-Crawler service CLI commands.
+"""Crawler CLI: a thin client of the running webserver's crawler routes.
 
-Talks to the running webserver via the FastAPI routes — no raw DB
-calls. Same shape as ``app/cli/health.py``: build an ``httpx`` client
-against the configured ``API_BASE_URL`` and hit the documented
-endpoints (``POST /crawl``, ``GET /pages``, ``GET /stats``).
-
-Usage::
-
-    <project> crawlstats
-    <project> crawlfetch https://example.com
-    <project> crawlfetch https://example.com -m campaign=march -m source=manual
-    <project> crawllist --limit 5
-    <project> crawllist --failed
-    <project> crawlretry-failed
+Same shape as ``app/cli/health.py``: an ``httpx`` client against the
+configured ``API_BASE_URL``, no raw DB calls. ``<project> crawl --help``
+lists the commands.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+from pathlib import Path
 import sys
 from typing import Any
+import zipfile
 
 import httpx
 from rich import box
@@ -36,6 +28,7 @@ from app.components.backend.api.crawler import API_PREFIX
 from app.core.config import settings
 from app.core.constants import Defaults
 from app.core.formatting import format_bytes, format_relative_time
+from app.services.crawler.export import MANIFEST
 from app.services.crawler.options import MAX_DEPTH, CrawlOptions
 from app.services.crawler.schemas import CrawlSummary
 
@@ -70,6 +63,23 @@ def _status(status_code: Any) -> str:
     return f"[{colour}]{code or '—'}[/{colour}]"
 
 
+def _fetch_table(title: str, rows: list[dict[str, Any]], *, url: str) -> Table:
+    """Fetched things, one shape: status, size, type when known, URL."""
+    typed = any(row.get("content_type") for row in rows)
+    table = Table(title=title, box=box.SIMPLE)
+    table.add_column("status", justify="right")
+    table.add_column("size", justify="right")
+    if typed:
+        table.add_column("type")
+    table.add_column("url")
+    for row in rows:
+        cells = [_status(row.get("status")), format_bytes(row.get("size") or 0)]
+        if typed:
+            cells.append(row.get("content_type") or "")
+        table.add_row(*cells, row.get(url) or "")
+    return table
+
+
 def _parse_metadata(pairs: list[str]) -> dict[str, Any]:
     """Parse ``-m key=value`` pairs into a dict.
 
@@ -88,11 +98,6 @@ def _parse_metadata(pairs: list[str]) -> dict[str, Any]:
         except json.JSONDecodeError:
             out[key] = raw
     return out
-
-
-# ---------------------------------------------------------------------
-# stats
-# ---------------------------------------------------------------------
 
 
 @app.command(help="Show document counts + last fetch timestamp.")
@@ -117,48 +122,23 @@ async def stats() -> None:
     console.print(table)
 
 
-# ---------------------------------------------------------------------
-# fetch
-# ---------------------------------------------------------------------
-
-
 @app.command(help="Fetch one URL and persist the result.")
 async def fetch(
     url: str = typer.Argument(..., help="URL to fetch."),
     metadata: list[str] = typer.Option(
-        [],
-        "--metadata",
-        "-m",
-        help=(
-            "Repeatable ``key=value`` pairs attached to the stored "
-            "document. Values are JSON-decoded if possible "
-            "(``-m count=5`` → int)."
-        ),
+        [], "--metadata", "-m", help="Repeatable key=value tags; values JSON-decoded."
     ),
     source_kind: str = typer.Option(
-        "crawl4ai",
-        "--source-kind",
-        help="Producer label written to the document's source_kind.",
+        "crawl4ai", "--source-kind", help="Producer label stored on the row."
     ),
     fresh: bool = typer.Option(
-        False,
-        "--fresh",
-        help=(
-            "Bypass both crawl4ai's network cache and row-level dedup. "
-            "Default uses the cache (no network on repeat URLs) and "
-            "skips inserts when content hash matches an existing row. "
-            "Pass ``--fresh`` for a true re-fetch."
-        ),
+        False, "--fresh", help="Bypass the cache and dedup; always refetch."
     ),
 ) -> None:
-    # Snapshot the most recent id so we can tell whether the API wrote
-    # a new row or returned an existing one (the fast-path dedup case).
-    # A returned id ≤ the snapshot means it was deduped (no insert).
+    # The newest id before the call tells a new row from a deduped one:
+    # an id at or below it means the API returned an existing row.
     async with _client() as client:
-        prior_resp = await client.get(
-            f"{API_PREFIX}/pages",
-            params={"limit": 1},
-        )
+        prior_resp = await client.get(f"{API_PREFIX}/pages", params={"limit": 1})
         prior_resp.raise_for_status()
         prior_rows = prior_resp.json()
         prior_max_id = prior_rows[0]["id"] if prior_rows else 0
@@ -197,11 +177,6 @@ async def fetch(
     )
 
 
-# ---------------------------------------------------------------------
-# list
-# ---------------------------------------------------------------------
-
-
 @app.command(help="Crawl one or more URLs as a background job.")
 async def site(
     urls: list[str] = typer.Argument(..., help="Seed URLs. A bare domain is fine."),
@@ -221,6 +196,9 @@ async def site(
         False, "--external", help="Follow links off the seed URL's site."
     ),
     fresh: bool = typer.Option(False, "--fresh", help="Bypass cache and dedup."),
+    assets: bool = typer.Option(
+        False, "--assets", help="Also fetch each page's images, styles, scripts."
+    ),
     source_kind: str = typer.Option("crawl4ai", "--source-kind"),
 ) -> None:
     """The same job the dashboard starts, from a terminal."""
@@ -231,17 +209,53 @@ async def site(
         min_words=min_words,
         stay_on_domain=not external,
         fresh=fresh,
+        assets=assets,
     )
 
+    await _run_job(
+        "/crawl-batch",
+        {"urls": urls, "options": options.model_dump(), "source_kind": source_kind},
+    )
+
+
+@app.command(help="Fetch every archived page of a site from the Wayback Machine.")
+async def wayback(
+    domain: str = typer.Argument(..., help="The archived site, e.g. example.com."),
+    from_ts: str = typer.Option("", "--from", help="Earliest capture, YYYYMMDD."),
+    to_ts: str = typer.Option("", "--to", help="Latest capture, YYYYMMDD."),
+    include: list[str] = typer.Option(
+        [], "--include", help="Only pages matching this glob (repeatable)."
+    ),
+    exclude: list[str] = typer.Option(
+        [], "--exclude", help="Skip pages matching this glob (repeatable)."
+    ),
+    fresh: bool = typer.Option(
+        False, "--fresh", help="Refetch pages the store already has."
+    ),
+    assets: bool = typer.Option(
+        False, "--assets", help="Also fetch each page's images, styles, scripts."
+    ),
+) -> None:
+    """One CDX listing, then the latest capture of each page, filed
+    under its original URL."""
+    options = CrawlOptions(
+        include=include, exclude=exclude, fresh=fresh, assets=assets
+    )
+    await _run_job(
+        "/wayback",
+        {
+            "domain": domain,
+            "from_ts": from_ts or None,
+            "to_ts": to_ts or None,
+            "options": options.model_dump(),
+        },
+    )
+
+
+async def _run_job(path: str, payload: dict[str, Any], *, noun: str = "page") -> None:
+    """Start a crawl job, follow its label until it lands, print what it got."""
     async with _client() as client:
-        resp = await client.post(
-            f"{API_PREFIX}/crawl-batch",
-            json={
-                "urls": urls,
-                "options": options.model_dump(),
-                "source_kind": source_kind,
-            },
-        )
+        resp = await client.post(f"{API_PREFIX}{path}", json=payload)
         resp.raise_for_status()
         job_id = resp.json()["job_id"]
 
@@ -259,15 +273,40 @@ async def site(
         raise typer.Exit(1)
 
     summary = CrawlSummary.model_validate(job.get("result") or {})
-    table = Table(title=f"Crawled {summary.fetched} page(s)", box=box.SIMPLE)
-    table.add_column("status", justify="right")
-    table.add_column("size", justify="right")
-    table.add_column("url")
-    for page in summary.pages:
-        table.add_row(_status(page.status), format_bytes(page.size), page.url)
-    console.print(table)
+    rows = [page.model_dump() for page in summary.pages]
+    console.print(_fetch_table(f"Crawled {summary.fetched} {noun}(s)", rows, url="url"))
     if summary.failed:
         console.print(f"[yellow]{summary.failed} failed[/yellow]")
+
+
+@app.command(help="Fetch the assets a crawled site's pages name and do not have yet.")
+async def assets(
+    site: str = typer.Argument(..., help="The site, as `crawl list` names it."),
+) -> None:
+    """Pages crawled before --assets, pages an archive pull skipped, and
+    assets whose fetch was throttled: one pass picks them all up."""
+    await _run_job(f"/sites/{site}/assets", {}, noun="asset")
+
+
+@app.command(help="Write a crawled site to a folder of plain files.")
+async def export(
+    site: str = typer.Argument(..., help="The site, as `crawl list` names it."),
+    directory: Path = typer.Argument(..., help="Where the files go."),
+) -> None:
+    """Pages as HTML and markdown at their URL paths, assets at theirs,
+    and a manifest.json naming them all. Re-running overwrites."""
+    async with _client() as client:
+        resp = await client.get(
+            f"{API_PREFIX}/sites/{site}/export", timeout=httpx.Timeout(600.0)
+        )
+        resp.raise_for_status()
+    archive = zipfile.ZipFile(io.BytesIO(resp.content))
+    archive.extractall(directory)
+    manifest = json.loads(archive.read(MANIFEST))
+    console.print(
+        f"[green]✓[/green] {len(manifest['pages'])} page(s), "
+        f"{len(manifest['assets'])} asset(s) → {directory}"
+    )
 
 
 @app.command("list", help="List recent pages.")
@@ -315,11 +354,6 @@ async def list_pages(
     console.print(f"\n[cyan]Total pages shown:[/cyan] {len(rows)}")
 
 
-# ---------------------------------------------------------------------
-# show
-# ---------------------------------------------------------------------
-
-
 @app.command(help="Show one document's body + metadata.")
 async def show(
     page_id: int = typer.Argument(..., help="CrawledPage id to render."),
@@ -335,6 +369,9 @@ async def show(
         "-h",
         help="Print only the first N characters of the body. 0 = full.",
     ),
+    html: bool = typer.Option(
+        False, "--html", help="Print the stored HTML instead of the markdown."
+    ),
 ) -> None:
     async with _client() as client:
         resp = await client.get(f"{API_PREFIX}/pages/{page_id}")
@@ -343,6 +380,7 @@ async def show(
             raise typer.Exit(1)
         resp.raise_for_status()
         doc = resp.json()
+        assets = (await client.get(f"{API_PREFIX}/pages/{page_id}/assets")).json()
 
     status_code = doc.get("status_code") or 0
 
@@ -368,8 +406,11 @@ async def show(
         header.add_row("metadata", json.dumps(doc["doc_metadata"]))
     console.print(header)
     console.print()
+    if assets:
+        rows = [{**a, "status": a.get("status_code")} for a in assets]
+        console.print(_fetch_table(f"{len(assets)} asset(s)", rows, url="original_url"))
 
-    body = doc.get("content") or ""
+    body = doc.get("html" if html else "content") or ""
     if not body:
         console.print("[dim](no body)[/dim]")
         return
@@ -380,7 +421,7 @@ async def show(
         console.print(body)
         return
 
-    content_type = (doc.get("content_type") or "").lower()
+    content_type = "html" if html else (doc.get("content_type") or "").lower()
     if content_type == "markdown":
         console.print(Panel(Markdown(body), title="content", border_style="dim"))
     elif content_type in ("html", "json"):
@@ -393,11 +434,6 @@ async def show(
         )
     else:
         console.print(Panel(body, title="content", border_style="dim"))
-
-
-# ---------------------------------------------------------------------
-# retry-failed
-# ---------------------------------------------------------------------
 
 
 @app.command("retry-failed", help="Re-fetch every document with status >= 400.")
@@ -421,7 +457,9 @@ async def retry_failed(
         )
         successes = 0
         for row in failed_rows:
-            url = row.get("source_url")
+            # A snapshot row retries through the archive, not the live host.
+            meta = row.get("doc_metadata") or {}
+            url = meta.get("archive_url") or row.get("source_url")
             if not url:
                 continue
             payload = {

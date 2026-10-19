@@ -50,16 +50,70 @@ page as it lands.
 |---|---|
 | `POST /crawl` | fetch one URL, store it, return the row |
 | `POST /crawl-batch` | start a background crawl, return `202` + a `job_id` |
+| `POST /wayback` | fetch every archived page of a site, same `202` + `job_id` |
 | `GET /sites` | crawled sites, with page and failure counts |
+| `POST /sites/{site}/assets` | fetch the site's missing assets, same `202` + `job_id` |
+| `GET /sites/{site}/export` | the site as a zip: pages, assets, `manifest.json` |
 | `GET /pages` | recent pages, newest first; `?site=` narrows, `?failed_only=` filters |
-| `GET /pages/{id}` | one stored page |
+| `GET /pages/{id}` | one stored page, markdown and the HTML it came from |
+| `GET /pages/{id}/assets` | the files that page references, and where their bytes are |
 | `GET /stats` | counts, distinct URLs, content-type split, last fetch |
 
-**CLI.** `<project> crawl stats | fetch | site | list | show | retry-failed`.
+**CLI.** `<project> crawl stats | fetch | site | wayback | assets | export | list | show | retry-failed`.
 
-**Progress.** A batch crawl runs as a framework job, so progress streams over
+**Progress.** A crawl runs as a framework job, so progress streams over
 `/api/v1/jobs/{job_id}/events` and the dashboard follows it without knowing anything about
-the crawler.
+the crawler. With the `worker` component the crawl runs there, on the plugin's own `crawler`
+queue (arq, TaskIQ or Dramatiq, whichever the stack uses), so a webserver restart leaves it
+running; without one it is a background task in the webserver. Either way pages stream
+through one at a time: each is stored and counted as it lands, and the job never holds the
+site in memory.
+
+## Archive snapshots
+
+A `web.archive.org/web/<timestamp>/<url>` URL is fetched in its raw `id_` form (the
+original bytes, no toolbar, no rewritten links) and stored under the original URL, with
+`snapshot_ts` and `archive_url` in `doc_metadata` and `source_kind = "wayback"`. The
+archived site shows up as itself in the sites view. Requests to archive.org go one at a
+time, `CRAWLER_ARCHIVE_DELAY_S` apart (default 4s), and a 429 or 503 is waited out and
+retried up to `CRAWLER_RETRY_LIMIT` times rather than stored as a failed page.
+
+A whole archived site is listed from the CDX index rather than crawled link by link,
+which would wander into the archive's own chrome:
+
+```bash
+<project> crawl wayback example.com --to 20191102 --exclude "*backup.php*"
+```
+
+One request lists every successful HTML capture (subdomains included); the latest
+capture of each page inside the `--from`/`--to` window is fetched, and pages the store
+already holds are skipped unless `--fresh`.
+
+## Assets
+
+With `--assets` (or `options.assets`), each stored page's same-site images, stylesheets,
+scripts and downloads are fetched too, once per site however many pages reference them,
+and kept in the project's object store (`app.core.storage`) under their content key, so
+one GIF on three hundred pages is one object. An archived page's assets come through the
+archive. A `crawled_asset` row records each one, including failures, which `show` lists.
+A definite miss (a 404) is not asked for again; a throttle or an outage is.
+
+`<project> crawl assets example.com` fetches whatever the site's stored pages name and
+do not have yet: pages crawled before `--assets`, pages an archive pull skipped as already
+stored, assets whose fetch was throttled.
+
+## Export
+
+```bash
+<project> crawl export example.com ./example.com
+```
+
+The site as a folder: each page's HTML and markdown at its URL path (`journal/may_2005.htm`
+and `journal/may_2005.md`, `index.html` for a directory), each asset at its own path, and
+a `manifest.json` naming every page and asset with its URL, snapshot timestamp, hash and
+content type, plus a `missing` list for any object the store no longer holds. The latest
+successful fetch of each page is the one exported. Re-running overwrites, so the folder
+is the archive and the stack is disposable.
 
 ## Crawl options
 
@@ -75,6 +129,9 @@ API, the CLI and the dashboard share them.
 | `selector` | none | CSS selector: keep only this part of each page |
 | `min_words` | `0` | drop blocks shorter than this many words (nav, chrome) |
 | `fresh` | `false` | bypass the network cache and row-level dedup |
+| `assets` | `false` | also fetch each page's images, stylesheets, scripts and downloads |
+| `include` | none | globs; keep only matching pages (the seed always lands) |
+| `exclude` | none | globs; drop matching pages |
 
 ```bash
 <project> crawl site example.com --depth 1 --max-pages 50 --selector "main article"

@@ -1,0 +1,150 @@
+"""A stored page's images, stylesheets, scripts and downloads come too.
+
+Each asset is fetched once per site however many pages reference it,
+and lands in the object store under its content key, so the same GIF on
+three hundred pages is one object. An archived page's assets go through
+the archive, like the page did.
+"""
+
+from typing import Any
+
+import httpx
+import pytest
+
+from app.core.storage import FilesystemStorage, set_storage
+from app.services.crawler.assets import discover, fetch_assets
+from app.services.crawler.models import CrawledPage
+from app.services.crawler.options import site_of
+
+PAGE = """
+<html><head>
+<link rel="stylesheet" href="/css/site.css">
+<link rel="icon" href="favicon.ico">
+<script src="js/app.js"></script>
+</head><body>
+<img src="images/menu.gif"><img src="images/menu.gif">
+<img src="https://cdn.other.test/x.png">
+<a href="media/module.zip">download</a>
+<a href="about.htm">about</a>
+</body></html>
+"""
+
+
+class TestDiscover:
+    def test_it_finds_same_site_assets_once_each_in_order(self) -> None:
+        assert discover(PAGE, "http://a.test/guide/index.htm") == [
+            "http://a.test/css/site.css",
+            "http://a.test/guide/favicon.ico",
+            "http://a.test/guide/js/app.js",
+            "http://a.test/guide/images/menu.gif",
+            "http://a.test/guide/media/module.zip",
+        ]
+
+
+@pytest.fixture
+def store(tmp_path: Any) -> Any:
+    set_storage(FilesystemStorage(tmp_path))
+    yield
+    set_storage(None)
+
+
+def _transport(hits: list[str]) -> httpx.MockTransport:
+    def handle(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        if request.url.path.endswith("missing.png"):
+            return httpx.Response(404)
+        return httpx.Response(200, content=b"GIF89a", headers={"content-type": "image/gif"})
+
+    return httpx.MockTransport(handle)
+
+
+async def _page(session: Any, url: str, html: str, **meta: Any) -> CrawledPage:
+    page = CrawledPage(
+        source_url=url, site=site_of(url), html=html, status_code=200, doc_metadata=meta
+    )
+    session.add(page)
+    await session.commit()
+    await session.refresh(page)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_assets_are_fetched_once_and_stored_by_content(
+    async_db_session: Any, store: Any
+) -> None:
+    hits: list[str] = []
+    html = '<img src="a.gif"><img src="b.gif"><img src="missing.png">'
+    one = await _page(async_db_session, "http://a.test/one", html)
+    two = await _page(async_db_session, "http://a.test/two", '<img src="a.gif">')
+
+    async with httpx.AsyncClient(transport=_transport(hits)) as client:
+        first = await fetch_assets(async_db_session, one, client=client)
+        second = await fetch_assets(async_db_session, two, client=client)
+
+    assert [a.original_url for a in first] == [
+        "http://a.test/a.gif",
+        "http://a.test/b.gif",
+        "http://a.test/missing.png",
+    ]
+    assert first[0].storage_key == first[1].storage_key, "same bytes, one object"
+    assert first[0].size == 6 and first[0].content_type == "image/gif"
+    assert first[0].site == "a.test"
+    assert first[2].status_code == 404 and first[2].storage_key is None
+    assert second == [], "a.gif was already stored for this site"
+    assert len(hits) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_missing_asset_is_not_asked_for_again(
+    async_db_session: Any, store: Any
+) -> None:
+    """A 404 on three hundred pages is one request, not three hundred
+    turns at the archive's pace. A throttle or an outage is retried."""
+    hits: list[str] = []
+    one = await _page(async_db_session, "http://a.test/one", '<img src="missing.png">')
+    two = await _page(async_db_session, "http://a.test/two", '<img src="missing.png">')
+
+    async with httpx.AsyncClient(transport=_transport(hits)) as client:
+        await fetch_assets(async_db_session, one, client=client)
+        again = await fetch_assets(async_db_session, two, client=client)
+
+    assert again == [] and len(hits) == 1
+
+
+@pytest.mark.asyncio
+async def test_assets_are_kept_per_site(async_db_session: Any, store: Any) -> None:
+    """Two sites naming one URL each get their own row, so each export
+    is whole; the bytes are still one object."""
+    hits: list[str] = []
+    shared = '<img src="http://blog.a.test/x.gif">'
+    one = await _page(async_db_session, "http://a.test/", shared)
+    two = await _page(async_db_session, "http://blog.a.test/", shared)
+
+    async with httpx.AsyncClient(transport=_transport(hits)) as client:
+        first = await fetch_assets(async_db_session, one, client=client)
+        second = await fetch_assets(async_db_session, two, client=client)
+
+    assert [a.site for a in first + second] == ["a.test", "blog.a.test"]
+    assert first[0].storage_key == second[0].storage_key
+
+
+@pytest.mark.asyncio
+async def test_an_archived_page_fetches_its_assets_through_the_archive(
+    async_db_session: Any, store: Any
+) -> None:
+    hits: list[str] = []
+    page = await _page(
+        async_db_session,
+        "http://a.test/post/",
+        '<img src="/wp-content/uploads/x.gif">',
+        snapshot_ts="20170911015439",
+    )
+
+    async with httpx.AsyncClient(transport=_transport(hits)) as client:
+        assets = await fetch_assets(async_db_session, page, client=client)
+
+    assert hits == [
+        "https://web.archive.org/web/20170911015439id_/"
+        "http://a.test/wp-content/uploads/x.gif"
+    ]
+    assert assets[0].original_url == "http://a.test/wp-content/uploads/x.gif"

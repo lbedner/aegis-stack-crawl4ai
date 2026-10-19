@@ -1,0 +1,140 @@
+"""A stored page's images, stylesheets, scripts and downloads.
+
+Discovery reads the page's own HTML with the standard library's parser:
+the same-site references a rebuild would need. Each asset is fetched
+once per site however many pages name it, and lands in the object store
+under its content key, so the same GIF on three hundred pages is one
+object. An archived page's assets go through the archive, like the page
+did, and archive.org's turn applies.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+
+import httpx
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from app.core.log import logger
+from app.core.storage import get_storage
+from app.services.crawler import queries
+from app.services.crawler.archive import (
+    THROTTLED,
+    http_client,
+    patiently,
+    resolve,
+    snapshot_url,
+)
+from app.services.crawler.models import CrawledAsset, CrawledPage
+from app.services.crawler.options import same_site, site_of
+from app.services.crawler.urls import canonical_url
+
+# A link is an asset when it points at a file, not a page.
+DOWNLOAD_SUFFIXES = (
+    ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar", ".mp3", ".mp4", ".wav",
+    ".avi", ".mov", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt",
+)  # fmt: skip
+
+# ponytail: asset URLs being fetched right now, so pages crawled side by
+# side do not both fetch the site's chrome before either has committed.
+# Per process; a queue would be needed if crawls ever spanned workers.
+_inflight: set[tuple[str, str]] = set()
+
+
+class _References(HTMLParser):
+    """Every asset reference in a page, in document order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.found: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        at = dict(attrs)
+        if tag in ("img", "script", "source", "embed") and at.get("src"):
+            self.found.append(str(at["src"]))
+        elif tag == "link" and at.get("href"):
+            self.found.append(str(at["href"]))
+        elif tag == "a" and at.get("href"):
+            href = str(at["href"])
+            if href.split("?", 1)[0].lower().endswith(DOWNLOAD_SUFFIXES):
+                self.found.append(href)
+
+
+def discover(html: str, page_url: str) -> list[str]:
+    """Same-site asset URLs the page references, once each, in order."""
+    parser = _References()
+    parser.feed(html)
+    seen: list[str] = []
+    for ref in parser.found:
+        url = canonical_url(urljoin(page_url, ref.strip()).split("#", 1)[0])
+        if url not in seen and same_site(page_url, url):
+            seen.append(url)
+    return seen
+
+
+def _fetch_url(page: CrawledPage, url: str) -> str:
+    """Where the asset is on the wire: the archive when the page came
+    from there, nearest capture to the page's own."""
+    ts = page.doc_metadata.get("snapshot_ts")
+    return resolve(snapshot_url(str(ts), url) if ts else url).fetch_url
+
+
+async def _fetch_one(
+    client: httpx.AsyncClient, page: CrawledPage, url: str
+) -> CrawledAsset:
+    fetch_url = _fetch_url(page, url)
+    response = await patiently(
+        site_of(fetch_url) or "",
+        lambda: client.get(fetch_url, follow_redirects=True),
+        lambda r: r.status_code in THROTTLED,
+    )
+    asset = CrawledAsset(
+        page_id=page.id,
+        site=str(page.site),
+        original_url=url,
+        status_code=response.status_code,
+        content_type=response.headers.get("content-type", "").split(";")[0] or None,
+        size=len(response.content),
+        fetched_at=datetime.now(UTC),
+    )
+    if response.is_success:
+        asset.storage_key = await get_storage().put(
+            response.content, content_type=asset.content_type
+        )
+    else:
+        logger.warning("crawler.asset failed url=%s status=%s", url, asset.status_code)
+    return asset
+
+
+async def fetch_assets(
+    session: AsyncSession,
+    page: CrawledPage,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> list[CrawledAsset]:
+    """Fetch and store every asset the page names that the site does
+    not already have settled. Failures land as rows too."""
+    if not page.html or not page.site:
+        return []
+    site = str(page.site)
+    wanted = discover(page.html, page.source_url)
+    known = await queries.stored_asset_urls(session, site, wanted)
+    todo = [u for u in wanted if u not in known and (site, u) not in _inflight]
+    if not todo:
+        return []
+    claimed = {(site, url) for url in todo}
+    _inflight.update(claimed)
+    assets: list[CrawledAsset] = []
+    try:
+        async with http_client(client) as http:
+            for url in todo:
+                assets.append(await _fetch_one(http, page, url))
+        session.add_all(assets)
+        await session.commit()
+    finally:
+        _inflight.difference_update(claimed)
+    return assets

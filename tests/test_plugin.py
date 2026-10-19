@@ -33,7 +33,15 @@ def _model_field_declarations() -> dict[str, str]:
     """
     fields: dict[str, str] = {}
     current: str | None = None
+    in_page = False
     for line in MODEL.splitlines():
+        if line.startswith("class "):
+            # Only the page table; the asset table shares the module.
+            in_page = line.startswith("class CrawledPage(")
+            current = None
+            continue
+        if not in_page:
+            continue
         match = re.match(r"    (\w+): ", line)
         if match:
             current = match.group(1)

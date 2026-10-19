@@ -1,0 +1,130 @@
+"""A crawled site leaves the stack as plain files.
+
+The store lives in a stack's database, and stacks are disposable. The
+export is the site as a folder: each page's HTML and markdown at its
+URL path, each asset at its own path, and a manifest naming them all,
+so a rebuild starts from a directory rather than a database.
+"""
+
+import io
+import json
+from typing import Any
+import zipfile
+
+import pytest
+
+from app.core.storage import FilesystemStorage, get_storage, set_storage
+from app.services.crawler.export import export_site, file_path
+from app.services.crawler.models import CrawledAsset, CrawledPage
+
+
+class TestFilePath:
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("http://a.test/", "index"),
+            ("http://a.test/journal/", "journal/index"),
+            ("http://a.test/journal/may_2005.htm", "journal/may_2005.htm"),
+            ("http://a.test/index.php?p=2", "index.php?p=2"),
+            ("http://a.test/a/../../etc/passwd", "a/etc/passwd"),
+            ("http://a.test/images/menu.gif", "images/menu.gif"),
+        ],
+    )
+    def test_a_url_becomes_a_path_inside_the_folder(self, url: str, expected: str) -> None:
+        assert file_path(url) == expected
+
+
+@pytest.fixture
+def store(tmp_path: Any) -> Any:
+    set_storage(FilesystemStorage(tmp_path))
+    yield
+    set_storage(None)
+
+
+@pytest.mark.asyncio
+async def test_a_site_exports_to_the_expected_tree(
+    async_db_session: Any, store: Any
+) -> None:
+    key = await get_storage().put(b"GIF89a", content_type="image/gif")
+    stale = CrawledPage(
+        source_url="http://a.test/", site="a.test", content="old", html="<p>old</p>",
+        content_type="markdown", status_code=200,
+    )
+    home = CrawledPage(
+        source_url="http://a.test/", site="a.test", content="# Home",
+        html="<h1>Home</h1>", content_type="markdown", content_hash="h1",
+        status_code=200, doc_metadata={"snapshot_ts": "20170911015439"},
+    )
+    post = CrawledPage(
+        source_url="http://a.test/journal/may_2005.htm", site="a.test",
+        content="# May", html="<h1>May</h1>", content_type="markdown",
+        content_hash="h2", status_code=200,
+    )
+    gone = CrawledPage(
+        source_url="http://a.test/missing", site="a.test", status_code=404
+    )
+    other = CrawledPage(
+        source_url="http://b.test/", site="b.test", content="x", html="x",
+        status_code=200,
+    )
+    for row in (stale, home, post, gone, other):
+        async_db_session.add(row)
+    await async_db_session.commit()
+    await async_db_session.refresh(home)
+    async_db_session.add(
+        CrawledAsset(
+            page_id=home.id, site="a.test", original_url="http://a.test/images/menu.gif",
+            content_type="image/gif", size=6, storage_key=key, status_code=200,
+        )
+    )
+    async_db_session.add(
+        CrawledAsset(
+            page_id=home.id, site="a.test", original_url="http://a.test/images/lost.gif",
+            status_code=404,
+        )
+    )
+    async_db_session.add(
+        CrawledAsset(
+            page_id=home.id, site="a.test", original_url="http://cdn.a.test/x.gif",
+            content_type="image/gif", size=6, storage_key=key, status_code=200,
+        )
+    )
+    async_db_session.add(
+        CrawledAsset(
+            page_id=home.id, site="a.test", original_url="http://a.test/gone.gif",
+            content_type="image/gif", size=1, status_code=200,
+            storage_key="sha256/00/00/" + "0" * 64,
+        )
+    )
+    await async_db_session.commit()
+
+    archive = zipfile.ZipFile(io.BytesIO(await export_site(async_db_session, "a.test")))
+
+    assert sorted(archive.namelist()) == [
+        "cdn.a.test/x.gif",
+        "images/menu.gif",
+        "index.html",
+        "index.md",
+        "journal/may_2005.htm",
+        "journal/may_2005.md",
+        "manifest.json",
+    ]
+    assert archive.read("index.html") == b"<h1>Home</h1>", "the latest fetch wins"
+    assert archive.read("images/menu.gif") == b"GIF89a"
+
+    manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["site"] == "a.test"
+    assert [p["source_url"] for p in manifest["pages"]] == [
+        "http://a.test/",
+        "http://a.test/journal/may_2005.htm",
+    ]
+    first = manifest["pages"][0]
+    assert first["html"] == "index.html" and first["markdown"] == "index.md"
+    assert first["doc_metadata"]["snapshot_ts"] == "20170911015439"
+    assert first["content_hash"] == "h1" and "content" not in first
+    assert [(a["original_url"], a["path"]) for a in manifest["assets"]] == [
+        ("http://a.test/images/menu.gif", "images/menu.gif"),
+        ("http://cdn.a.test/x.gif", "cdn.a.test/x.gif"),
+    ]
+    assert manifest["assets"][0]["storage_key"] == key
+    assert manifest["missing"] == ["http://a.test/gone.gif"]

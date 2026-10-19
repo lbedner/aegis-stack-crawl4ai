@@ -1,0 +1,243 @@
+"""A Wayback snapshot is stored as the page it archived.
+
+``web.archive.org/web/<ts>/<url>`` serves the page with a toolbar and
+every link rewritten; the ``id_`` form serves the original bytes. The
+row is filed under the original URL, so the archive is one more way to
+reach a site rather than a site of its own, and archive.org's throttle
+is waited out, process-wide, rather than recorded as a failure.
+"""
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from app.services.crawler import archive
+from app.services.crawler.archive import resolve
+from app.services.crawler.options import CrawlOptions
+from app.services.crawler.service import CrawlerService
+from app.services.crawler.urls import canonical_url
+
+SNAPSHOT = "https://web.archive.org/web/20170911015439/http://a.test/post/"
+
+
+class _Result:
+    success = True
+    status_code = 200
+    markdown = "# Hi"
+    html = "<h1>Hi</h1>"
+    metadata: dict[str, Any] = {}
+
+
+class _Throttled:
+    success = False
+    status_code = None
+    error_message = "HTTP request failed: HTTP 429: Unexpected status code"
+
+
+def _fake_crawler(crawler: CrawlerService, arun: Any) -> None:
+    """Point the service at a stand-in for crawl4ai."""
+
+    class _Crawler:
+        pass
+
+    _Crawler.arun = staticmethod(arun)  # type: ignore[attr-defined]
+
+    async def get() -> Any:
+        return _Crawler()
+
+    crawler._get_crawler = get  # type: ignore[method-assign]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Nobody waits for real, and no test inherits another's pacing."""
+    archive._turns.clear()
+    archive._not_before.clear()
+    naps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        naps.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(archive.asyncio, "sleep", fake_sleep)
+    return naps
+
+
+class TestResolve:
+    def test_a_snapshot_is_fetched_raw_and_filed_under_the_original(self) -> None:
+        target = resolve(SNAPSHOT)
+
+        assert target.fetch_url == (
+            "https://web.archive.org/web/20170911015439id_/http://a.test/post/"
+        )
+        assert target.url == "http://a.test/post/"
+        assert target.doc_metadata == {
+            "snapshot_ts": "20170911015439",
+            "archive_url": SNAPSHOT,
+        }
+        assert target.source_kind == "wayback"
+
+    @pytest.mark.parametrize("flag", ["id_", "im_", "cs_"])
+    def test_a_flagged_snapshot_is_recognised(self, flag: str) -> None:
+        url = f"https://web.archive.org/web/20170911015439{flag}/http://a.test/"
+        target = resolve(url)
+        assert target.url == "http://a.test/"
+        assert target.fetch_url.endswith("20170911015439id_/http://a.test/")
+
+    def test_a_plain_url_is_left_alone(self) -> None:
+        target = resolve("https://a.test/x")
+        assert target.fetch_url == "https://a.test/x"
+        assert target.url == "https://a.test/x"
+        assert target.doc_metadata == {}
+        assert target.source_kind is None
+
+    def test_the_archive_copy_and_the_live_copy_share_one_address(self) -> None:
+        """CDX originals carry ``:80``; a live crawl does not. One row key."""
+        archived = resolve("https://web.archive.org/web/2017/http://A.test:80/x")
+        assert archived.url == resolve("http://a.test/x").url == "http://a.test/x"
+
+
+class TestCanonicalUrl:
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("http://A.test", "http://a.test/"),
+            ("http://a.test:80/x", "http://a.test/x"),
+            ("https://a.test:443/", "https://a.test/"),
+            ("https://a.test:8443/x?q=1", "https://a.test:8443/x?q=1"),
+            ("not a url", "not a url"),
+        ],
+    )
+    def test_canonical_url(self, url: str, expected: str) -> None:
+        assert canonical_url(url) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_page_keeps_its_html_beside_the_markdown(
+    async_db_session: Any,
+) -> None:
+    """Markdown is what the dashboard reads; the HTML is what a rebuild reads."""
+    page = await CrawlerService()._store(
+        async_db_session, _Result(), url="https://a.test/"
+    )
+
+    assert page.content == "# Hi"
+    assert page.content_type == "markdown"
+    assert page.html == "<h1>Hi</h1>"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_snapshot_belongs_to_the_archived_site(
+    async_db_session: Any,
+) -> None:
+    page = await CrawlerService()._store(
+        async_db_session, _Result(), url=SNAPSHOT, doc_metadata={"tag": "x"}
+    )
+
+    assert page.source_url == "http://a.test/post/"
+    assert page.site == "a.test"
+    assert page.source_kind == "wayback"
+    assert page.doc_metadata["snapshot_ts"] == "20170911015439"
+    assert page.doc_metadata["tag"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_fetch_backs_off_and_retries(
+    _fresh_clock: list[float],
+) -> None:
+    """A 429 is the host asking for a pause, not a failed page."""
+    crawler = CrawlerService()
+    answers: list[Any] = [_Throttled(), _Throttled(), _Result()]
+    calls: list[str] = []
+
+    async def arun(**kwargs: Any) -> Any:
+        calls.append(kwargs["url"])
+        return answers.pop(0)
+
+    _fake_crawler(crawler, arun)
+    outcome = await crawler._run("https://a.test/x", CrawlOptions())
+
+    assert outcome.success is True
+    assert len(calls) == 3
+    naps = _fresh_clock
+    assert len(naps) == 2 and naps[1] > naps[0], "each wait is longer"
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_stays_busy_is_a_stored_failure(
+    _fresh_clock: list[float],
+) -> None:
+    """The retries run out; the last answer is kept, with no wait after it."""
+    from app.core.config import settings
+
+    crawler = CrawlerService()
+
+    async def arun(**kwargs: Any) -> Any:
+        return _Throttled()
+
+    _fake_crawler(crawler, arun)
+    outcome = await crawler._run("https://a.test/x", CrawlOptions())
+
+    assert outcome.success is False
+    assert len(_fresh_clock) == settings.CRAWLER_RETRY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_archive_fetches_take_turns(_fresh_clock: list[float]) -> None:
+    """One request at a time to archive.org, a pause between them, even
+    from two services in the same process."""
+    in_flight = 0
+    overlap = False
+
+    async def arun(**kwargs: Any) -> Any:
+        nonlocal in_flight, overlap
+        in_flight += 1
+        overlap = overlap or in_flight > 1
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return _Result()
+
+    one, two = CrawlerService(), CrawlerService()
+    _fake_crawler(one, arun)
+    _fake_crawler(two, arun)
+    await asyncio.gather(
+        one._run(SNAPSHOT, CrawlOptions()), two._run(SNAPSHOT, CrawlOptions())
+    )
+
+    assert overlap is False
+    assert any(n > 0 for n in _fresh_clock), "the second fetch waited its turn"
+
+
+@pytest.mark.asyncio
+async def test_a_pause_the_archive_asked_for_holds_every_waiter(
+    _fresh_clock: list[float],
+) -> None:
+    """When one fetch gets a 429, the next fetch to the archive waits the
+    backoff too, rather than collecting its own 429 in the meantime."""
+    from app.core.config import settings
+
+    answers: list[Any] = [_Throttled(), _Result(), _Result()]
+
+    async def arun(**kwargs: Any) -> Any:
+        return answers.pop(0)
+
+    crawler = CrawlerService()
+    _fake_crawler(crawler, arun)
+    await asyncio.gather(
+        crawler._run(SNAPSHOT, CrawlOptions()),
+        crawler._run(SNAPSHOT + "two", CrawlOptions()),
+    )
+
+    assert max(_fresh_clock) >= settings.CRAWLER_ARCHIVE_DELAY_S - 0.01
+    assert not answers, "both pages were fetched after the pause"
+
+
+@pytest.mark.asyncio
+async def test_a_deep_crawl_of_the_archive_is_refused() -> None:
+    """crawl4ai fetches a streamed deep crawl itself, outside the host's
+    turns, so the archive's pace could not be kept. The listing is the
+    way in."""
+    with pytest.raises(ValueError, match="crawl wayback"):
+        await CrawlerService()._run(SNAPSHOT, CrawlOptions(depth=1))

@@ -6,12 +6,14 @@ job lands. Everything here is the producing half of that contract: the
 labels the stream carries, and the summary the terminal frame carries.
 """
 
+import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 
-from app.services.crawler.dispatch import start_crawl
+from app.services.crawler import dispatch
 from app.services.crawler.jobs import run_crawl
 from app.services.crawler.service import CrawlerService
 from app.services.system.jobs import get_job_runner
@@ -24,6 +26,13 @@ async def _session() -> Any:
 
 def _factory() -> Any:
     return _session()
+
+
+def _collect(labels: list[str]) -> Any:
+    async def report(label: str) -> None:
+        labels.append(label)
+
+    return report
 
 
 class _Page:
@@ -43,20 +52,22 @@ class _Page:
 
 
 @pytest.mark.asyncio
-async def test_batch_fetch_reports_each_url_as_it_lands() -> None:
-    """One label per URL, so a stalled crawl is visibly stalled rather
+async def test_batch_fetch_reports_each_url_as_it_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One label per page, so a stalled crawl is visibly stalled rather
     than silent."""
-    crawler = CrawlerService()
     labels: list[str] = []
 
-    async def fake_crawl(_session: Any, *, url: str, **_kwargs: Any) -> list[_Page]:
-        return [_Page(200, url)]
+    async def fake_crawl(
+        self: Any, _session: Any, *, url: str, **_kwargs: Any
+    ) -> AsyncIterator[_Page]:
+        yield _Page(200, url)
 
-    crawler.crawl = fake_crawl  # type: ignore[method-assign]
-    await crawler.batch_fetch(
-        _factory,
-        urls=["https://a.test", "https://b.test", "https://c.test"],
-        report=labels.append,
+    monkeypatch.setattr(CrawlerService, "crawl", fake_crawl)
+    await run_crawl(
+        ["https://a.test", "https://b.test", "https://c.test"],
+        report=_collect(labels),
     )
 
     assert len(labels) == 3
@@ -64,49 +75,113 @@ async def test_batch_fetch_reports_each_url_as_it_lands() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_crawl_summarises_what_happened() -> None:
+async def test_batch_fetch_hands_pages_over_as_they_land() -> None:
+    """A page is yielded while other seeds are still fetching, so nothing
+    waits for the slowest host and nothing piles up in memory."""
+    crawler = CrawlerService()
+    release = asyncio.Event()
+
+    async def fake_crawl(
+        _session: Any, *, url: str, **_kwargs: Any
+    ) -> AsyncIterator[_Page]:
+        if url == "https://slow.test":
+            await release.wait()
+        yield _Page(200, url)
+
+    crawler.crawl = fake_crawl  # type: ignore[method-assign]
+    stream = crawler.batch_fetch(
+        _factory, urls=["https://slow.test", "https://fast.test"]
+    )
+    first = await asyncio.wait_for(anext(stream), timeout=1)
+    assert first.source_url == "https://fast.test", "the slow seed did not block"
+    release.set()
+    rest = [page async for page in stream]
+    assert [p.source_url for p in rest] == ["https://slow.test"]
+
+
+@pytest.mark.asyncio
+async def test_one_failing_seed_does_not_stop_its_peers() -> None:
+    """The other seeds finish and their pages land; the failure is raised
+    at the end, so the job says why rather than losing it."""
+    crawler = CrawlerService()
+
+    async def fake_crawl(
+        _session: Any, *, url: str, **_kwargs: Any
+    ) -> AsyncIterator[_Page]:
+        if url == "https://bad.test":
+            raise RuntimeError("disk full")
+        await asyncio.sleep(0)
+        yield _Page(200, url)
+
+    crawler.crawl = fake_crawl  # type: ignore[method-assign]
+    landed: list[str] = []
+    with pytest.raises(RuntimeError, match="disk full"):
+        async for page in crawler.batch_fetch(
+            _factory, urls=["https://bad.test", "https://a.test", "https://b.test"]
+        ):
+            landed.append(page.source_url)
+    assert sorted(landed) == ["https://a.test", "https://b.test"]
+
+
+@pytest.mark.asyncio
+async def test_a_reader_that_stops_early_leaves_no_seed_running() -> None:
+    crawler = CrawlerService()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_crawl(
+        _session: Any, *, url: str, **_kwargs: Any
+    ) -> AsyncIterator[_Page]:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield _Page(200, url)
+
+    crawler.crawl = fake_crawl  # type: ignore[method-assign]
+    stream = crawler.batch_fetch(_factory, urls=["https://a.test"])
+    getter = asyncio.ensure_future(anext(stream))
+    await started.wait()
+    getter.cancel()
+    await asyncio.gather(getter, return_exceptions=True)
+    await stream.aclose()
+    assert cancelled.is_set(), "the seed kept running after the reader left"
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_summarises_what_happened(monkeypatch: pytest.MonkeyPatch) -> None:
     """The terminal SSE frame carries this dict; the tab renders it."""
     labels: list[str] = []
 
-    async def fake_batch(*_args: Any, **kwargs: Any) -> list[_Page]:
-        report = kwargs.get("report")
-        if report is not None:
-            report("working")
-        return [_Page(200), _Page(503), _Page(None)]
+    async def fake_batch(*_args: Any, **kwargs: Any) -> AsyncIterator[_Page]:
+        for page in (_Page(200), _Page(503), _Page(None)):
+            yield page
 
-    original = CrawlerService.batch_fetch
-    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
-    try:
-        summary = await run_crawl(
-            ["https://a.test", "https://b.test", "https://c.test"],
-            report=labels.append,
-        )
-    finally:
-        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+    monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
+    summary = await run_crawl(
+        ["https://a.test", "https://b.test", "https://c.test"],
+        report=_collect(labels),
+    )
 
     assert summary.requested == 3
     assert summary.fetched == 3
     assert summary.failed == 2
-    assert labels, "the job narrated nothing"
+    assert labels and "3" in labels[-1], "the job narrated nothing"
 
 
 @pytest.mark.asyncio
-async def test_run_crawl_says_what_it_fetched() -> None:
+async def test_run_crawl_says_what_it_fetched(monkeypatch: pytest.MonkeyPatch) -> None:
     """Counts alone say it worked, not what you got. The result carries
     a row per page so the tab can show them without a second request."""
 
-    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
-        return [
-            _Page(200, "https://a.test", "markdown", "hello", id=1),
-            _Page(503, "https://b.test", "html", None, id=2),
-        ]
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> AsyncIterator[_Page]:
+        yield _Page(200, "https://a.test", "markdown", "hello", id=1)
+        yield _Page(503, "https://b.test", "html", None, id=2)
 
-    original = CrawlerService.batch_fetch
-    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
-    try:
-        summary = await run_crawl(["https://a.test", "https://b.test"])
-    finally:
-        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+    monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
+    summary = await run_crawl(["https://a.test", "https://b.test"])
 
     assert [page.model_dump() for page in summary.pages] == [
         {
@@ -129,20 +204,16 @@ async def test_run_crawl_says_what_it_fetched() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_preview_is_a_snippet_not_the_whole_page() -> None:
+async def test_a_preview_is_a_snippet_not_the_whole_page(monkeypatch: pytest.MonkeyPatch) -> None:
     """The rows ride an SSE frame, so a 200 KB page contributes a
     snippet, not 200 KB."""
     from app.services.crawler.jobs import PREVIEW_CHARS
 
-    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
-        return [_Page(200, content="x" * (PREVIEW_CHARS * 10))]
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> AsyncIterator[_Page]:
+        yield _Page(200, content="x" * (PREVIEW_CHARS * 10))
 
-    original = CrawlerService.batch_fetch
-    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
-    try:
-        summary = await run_crawl(["https://a.test"])
-    finally:
-        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+    monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
+    summary = await run_crawl(["https://a.test"])
 
     row = summary.pages[0]
     assert len(row.preview) == PREVIEW_CHARS
@@ -150,42 +221,39 @@ async def test_a_preview_is_a_snippet_not_the_whole_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_huge_crawl_does_not_ship_every_row() -> None:
+async def test_a_huge_crawl_does_not_ship_every_row(monkeypatch: pytest.MonkeyPatch) -> None:
     """The result rides an SSE frame; the counts stay exact while the
     rows are capped."""
     from app.services.crawler.jobs import RESULT_PAGE_LIMIT
 
     many = [_Page(200) for _ in range(RESULT_PAGE_LIMIT + 25)]
 
-    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
-        return many
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> AsyncIterator[_Page]:
+        for page in many:
+            yield page
 
-    original = CrawlerService.batch_fetch
-    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
-    try:
-        summary = await run_crawl(["https://a.test"] * len(many))
-    finally:
-        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+    monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
+    summary = await run_crawl(["https://a.test"] * len(many))
 
     assert summary.fetched == len(many)
     assert len(summary.pages) == RESULT_PAGE_LIMIT
 
 
 @pytest.mark.asyncio
-async def test_start_crawl_returns_a_job_the_runner_knows() -> None:
+async def test_start_crawl_returns_a_job_the_runner_knows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The id the endpoint returns has to be the id the SSE stream
-    accepts, or the tab follows nothing."""
+    accepts, or the tab follows nothing. The in-process path, whichever
+    the stack would pick."""
+    monkeypatch.setattr(dispatch, "_start", dispatch.start_in_process)
 
-    async def fake_batch(*_args: Any, **_kwargs: Any) -> list[_Page]:
-        return [_Page(200)]
+    async def fake_batch(*_args: Any, **_kwargs: Any) -> AsyncIterator[_Page]:
+        yield _Page(200)
 
-    original = CrawlerService.batch_fetch
-    CrawlerService.batch_fetch = fake_batch  # type: ignore[method-assign]
-    try:
-        job_id = await start_crawl(["https://a.test"])
-        snapshot = await get_job_runner().wait(job_id)
-    finally:
-        CrawlerService.batch_fetch = original  # type: ignore[method-assign]
+    monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
+    job_id = await dispatch.start_crawl(["https://a.test"])
+    snapshot = await get_job_runner().wait(job_id)
 
     assert snapshot.status == "done", snapshot.error
     assert snapshot.result is not None

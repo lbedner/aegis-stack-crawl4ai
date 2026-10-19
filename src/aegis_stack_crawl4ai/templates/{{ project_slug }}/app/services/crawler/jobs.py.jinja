@@ -1,18 +1,31 @@
 """What a crawl job does, and what its SSE stream carries.
 
-``report`` becomes the job's label, so the dashboard shows "Fetched 3 of
-12" while the work runs. The returned dict becomes the job's result: the
-counts, plus a row per page so the tab can say what it actually got
-without going back to the API for it.
+``report`` becomes the job's label, so the dashboard shows "Stored 3
+page(s)" while the work runs. The returned summary becomes the job's
+result: the counts, plus a sample of pages so the tab can say what it
+actually got without going back to the API for it. Pages stream through
+and are counted; the job never holds the site.
+
+One ``run_job_kind`` names every kind of crawl job, so the in-process
+runner and the worker's task hand the same work to the same code.
 """
 
-from collections.abc import Callable
+from typing import Any
 
 from app.core.db import AsyncSessionLocal
+from app.services.crawler import queries
+from app.services.crawler.archive import resolve
+from app.services.crawler.assets import fetch_assets
 from app.services.crawler.models import CrawledPage
 from app.services.crawler.options import CrawlOptions
-from app.services.crawler.schemas import CrawledPageResult, CrawlSummary
+from app.services.crawler.schemas import (
+    CrawledPageResult,
+    CrawlSummary,
+    WaybackRequest,
+)
 from app.services.crawler.service import CrawlerService
+from app.services.crawler.wayback import enumerate_site
+from app.services.system.jobs import SetLabel, unwatched
 
 PREVIEW_CHARS = 400
 """How much of a body travels back with the result.
@@ -22,12 +35,13 @@ enough that a hundred of them still fit in one SSE frame. The whole body
 is in the store; this is a look, not a copy.
 """
 
-RESULT_PAGE_LIMIT = 100
+RESULT_PAGE_LIMIT = 20
 """Rows carried back in the job result.
 
-The result rides one SSE frame, so a thousand-URL crawl must not put a
-thousand rows in it. The counts stay exact; the rows are a sample, and
-every page is in the store either way.
+The result rides one SSE frame and, with a worker, sits in Redis where
+every watcher's poll reads it again, so a thousand-URL crawl must not
+put a thousand rows in it. The counts stay exact; the rows are a sample,
+and every page is in the store either way.
 """
 
 
@@ -49,7 +63,7 @@ async def run_crawl(
     *,
     options: CrawlOptions | None = None,
     source_kind: str = "crawl4ai",
-    report: Callable[[str], None] | None = None,
+    report: SetLabel = unwatched,
 ) -> CrawlSummary:
     """Fetch every URL, narrating progress, and report what came back.
 
@@ -57,23 +71,91 @@ async def run_crawl(
     counts them rather than the job failing on the first bad host.
     """
     crawler = CrawlerService()
+    summary = CrawlSummary(requested=len(urls))
     try:
-        pages = await crawler.batch_fetch(
-            AsyncSessionLocal,
-            urls=urls,
-            options=options,
-            source_kind=source_kind,
-            report=report,
-        )
+        async for page in crawler.batch_fetch(
+            AsyncSessionLocal, urls=urls, options=options, source_kind=source_kind
+        ):
+            summary.fetched += 1
+            if not page.status_code or page.status_code >= 400:
+                summary.failed += 1
+            if len(summary.pages) < RESULT_PAGE_LIMIT:
+                summary.pages.append(_row(page))
+            await report(f"Stored {summary.fetched} page(s) from {len(urls)} URL(s)")
     finally:
         await crawler.aclose()
+    return summary
 
-    failed = sum(
-        1 for page in pages if not page.status_code or page.status_code >= 400
+
+async def run_wayback(
+    request: WaybackRequest, *, report: SetLabel = unwatched
+) -> CrawlSummary:
+    """List the archived site, drop what the store already has, fetch
+    the rest. Each page is one snapshot, filed under its original URL."""
+    options = request.options
+    snapshots = await enumerate_site(
+        request.domain, from_ts=request.from_ts, to_ts=request.to_ts, options=options
     )
-    return CrawlSummary(
-        requested=len(urls),
-        fetched=len(pages),
-        failed=failed,
-        pages=[_row(page) for page in pages[:RESULT_PAGE_LIMIT]],
-    )
+    if not options.fresh:
+        originals = {url: resolve(url).url for url in snapshots}
+        async with AsyncSessionLocal() as session:
+            stored = await queries.stored_ok_urls(session, list(originals.values()))
+        snapshots = [url for url in snapshots if originals[url] not in stored]
+    await report(f"Listed {len(snapshots)} page(s) to fetch")
+    return await run_crawl(snapshots, options=options, report=report)
+
+
+async def run_assets(site: str, *, report: SetLabel = unwatched) -> CrawlSummary:
+    """Fetch the assets of every stored page of a site that the site does
+    not have yet: pages crawled before ``--assets``, pages the archive
+    pull skipped as already stored, and assets whose fetch was throttled.
+    ``requested`` counts pages looked at; ``fetched`` and ``failed``
+    count assets."""
+    async with AsyncSessionLocal() as session:
+        pages = await queries.site_pages(session, site)
+        fetched = failed = 0
+        for index, page in enumerate(pages, 1):
+            assets = await fetch_assets(session, page)
+            fetched += sum(1 for a in assets if a.storage_key)
+            failed += sum(1 for a in assets if not a.storage_key)
+            await report(f"Page {index} of {len(pages)}: {fetched} asset(s) stored")
+    return CrawlSummary(requested=len(pages), fetched=fetched, failed=failed)
+
+
+async def run_job_kind(
+    kind: str, payload: dict[str, Any], *, report: SetLabel = unwatched
+) -> CrawlSummary:
+    """The one map from a job's kind and JSON payload to the work."""
+    if kind == "crawl":
+        return await run_crawl(
+            payload["urls"],
+            options=CrawlOptions.model_validate(payload.get("options") or {}),
+            source_kind=payload.get("source_kind") or "crawl4ai",
+            report=report,
+        )
+    if kind == "wayback":
+        return await run_wayback(WaybackRequest.model_validate(payload), report=report)
+    if kind == "assets":
+        return await run_assets(payload["site"], report=report)
+    raise ValueError(f"unknown crawl job kind: {kind!r}")
+{%- if include_worker %}
+
+
+async def run_job(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """The worker's entry: narrate into the shared job store, then finish.
+    The crawl loop is async, so each label is simply awaited: one Redis
+    write per stored page, beside the page's own commit."""
+    from app.services.system.job_store import RedisJobStore
+
+    store = RedisJobStore.shared()
+    try:
+        summary = await run_job_kind(kind, payload, report=store.label_writer(job_id))
+        result = summary.model_dump()
+        await store.finish(job_id, result)
+        return result
+    except Exception as exc:
+        await store.fail(job_id, str(exc) or type(exc).__name__)
+        raise
+    finally:
+        await store.aclose()
+{%- endif %}

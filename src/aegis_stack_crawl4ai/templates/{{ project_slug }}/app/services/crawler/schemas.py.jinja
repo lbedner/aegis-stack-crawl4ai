@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -81,6 +81,19 @@ class BatchCrawlRequest(BaseModel):
     )
 
 
+CaptureTs = Annotated[str | None, Field(default=None, pattern=r"^\d{4,14}$")]
+"""A Wayback timestamp prefix, ``YYYY`` through ``YYYYMMDDhhmmss``."""
+
+
+class WaybackRequest(BaseModel):
+    """Inbound request: fetch every archived page of a site as one job."""
+
+    domain: str = Field(min_length=1, max_length=255)
+    from_ts: CaptureTs = None
+    to_ts: CaptureTs = None
+    options: CrawlOptions = Field(default_factory=CrawlOptions)
+
+
 class CrawlRequest(BaseModel):
     """Inbound request: fetch one URL and store the result."""
 
@@ -120,8 +133,9 @@ class CrawlRequest(BaseModel):
     )
 
 
-class CrawledPageRead(BaseModel):
-    """Outbound shape of a stored document."""
+class CrawledPageSummary(BaseModel):
+    """Outbound shape of a stored document in a listing: everything but
+    the HTML, which the listing query does not even load."""
 
     id: int
     source_url: str
@@ -132,6 +146,28 @@ class CrawledPageRead(BaseModel):
     doc_metadata: dict[str, Any]
     status_code: int | None
     source_kind: str
+    fetched_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CrawledPageRead(CrawledPageSummary):
+    """One stored document in full, HTML included."""
+
+    html: str | None = None
+
+
+class CrawledAssetRead(BaseModel):
+    """One asset a stored page references, and where its bytes are."""
+
+    id: int
+    page_id: int | None
+    site: str
+    original_url: str
+    content_type: str | None
+    size: int
+    storage_key: str | None
+    status_code: int | None
     fetched_at: datetime
 
     model_config = {"from_attributes": True}
