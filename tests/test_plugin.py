@@ -88,10 +88,14 @@ class TestIdentity:
         assert get_spec().version == pyproject["project"]["version"]
 
     def test_aegis_version_pinned(self) -> None:
-        """Pin to a CLI version that has the schema-isolation foundation."""
+        """The floor is the framework that runs a plugin's queue as its
+        own worker container; the spec and the package agree on it."""
         spec = get_spec()
-        assert spec.aegis_version
-        assert ">=" in spec.aegis_version
+        assert spec.aegis_version == ">=0.16.0"
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        assert "aegis-stack>=0.16.0" in pyproject["project"]["dependencies"]
 
 
 class TestSchemaIsolation:
@@ -112,6 +116,11 @@ class TestDependencies:
     def test_requires_database(self) -> None:
         """Auto-installs the database component if the project lacks it."""
         assert "database" in get_spec().required_components
+
+    def test_declares_its_worker_queue(self) -> None:
+        """A stack with the worker component runs a ``worker-crawler``
+        container; without the declaration a crawl sits queued forever."""
+        assert get_spec().worker_queues == ["crawler"]
 
     def test_pyproject_dep_pins_security_hotfix(self) -> None:
         """v0.8.6 is the supply-chain hotfix — earlier 0.8.x pulls the
