@@ -9,12 +9,13 @@ from typing import Any
 
 import pytest
 
-from app.services.crawler.options import CrawlOptions, same_site
+from app.services.crawler.schemas import CrawlOptions
 from app.services.crawler.service import (
     CrawlerService,
     _page_metadata,
     _status_from_error,
 )
+from app.services.crawler.utils import same_site
 
 
 class TestDefaults:
@@ -288,6 +289,6 @@ class TestSiteOf:
         ],
     )
     def test_site_of(self, url: str, expected: str | None) -> None:
-        from app.services.crawler.options import site_of
+        from app.services.crawler.utils import site_of
 
         assert site_of(url) == expected

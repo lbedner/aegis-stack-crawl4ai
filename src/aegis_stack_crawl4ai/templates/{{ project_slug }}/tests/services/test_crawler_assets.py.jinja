@@ -12,9 +12,13 @@ import httpx
 import pytest
 
 from app.core.storage import FilesystemStorage, set_storage
-from app.services.crawler.assets import discover, fetch_assets
+from app.services.crawler.domains.assets import discover, fetch_assets
 from app.services.crawler.models import CrawledPage
-from app.services.crawler.options import site_of
+from app.services.crawler.utils import site_of
+
+# Each page asks once what its site has settled, so two pages are two of
+# one statement: the per-page query is the design, not a loop per asset.
+pytestmark = pytest.mark.queryspy(threshold=3)
 
 PAGE = """
 <html><head>
@@ -64,7 +68,6 @@ async def _page(session: Any, url: str, html: str, **meta: Any) -> CrawledPage:
     )
     session.add(page)
     await session.commit()
-    await session.refresh(page)
     return page
 
 
@@ -92,6 +95,43 @@ async def test_assets_are_fetched_once_and_stored_by_content(
     assert first[2].status_code == 404 and first[2].storage_key is None
     assert second == [], "a.gif was already stored for this site"
     assert len(hits) == 3
+
+
+@pytest.mark.asyncio
+async def test_the_write_lock_is_not_held_while_assets_are_fetched(
+    async_db_session: Any, store: Any
+) -> None:
+    """On SQLite a transaction is the one write lock. Holding it across
+    a page's worth of downloads stalls every other process, so the
+    lookup's transaction ends before the first request goes out."""
+    in_transaction: list[bool] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        in_transaction.append(async_db_session.in_transaction())
+        return httpx.Response(200, content=b"x", headers={"content-type": "image/gif"})
+
+    page = await _page(async_db_session, "http://a.test/", '<img src="a.gif">')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        await fetch_assets(async_db_session, page, client=client)
+
+    assert in_transaction == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_network_failure_is_a_failed_asset_not_a_dead_crawl(
+    async_db_session: Any, store: Any
+) -> None:
+    """A refused connection lands as a 599 row, as a page's would, and
+    the crawl carries on; a raise here would end the whole seed."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed")
+
+    page = await _page(async_db_session, "http://a.test/", '<img src="a.gif">')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        assets = await fetch_assets(async_db_session, page, client=client)
+
+    assert [(a.status_code, a.storage_key) for a in assets] == [(599, None)]
 
 
 @pytest.mark.asyncio

@@ -30,13 +30,15 @@ from aegis.core.plugins.spec import (
     SymbolWiring,
 )
 
-# The name the health check reports under. The dashboard groups services
-# by it, the card factory dispatches on it, and the modal registers under
+# The name the health check reports under: the service folder's name, as
+# every framework service's is, so the system model owns the crawler's
+# tables through it. The dashboard groups services by it, the card
+# factory dispatches on it, and the modal registers under
 # ``service_<label>``; the rendered code mirrors it in
 # ``app/components/frontend/dashboard/crawler_ui.py``, which derives it
 # from ``SERVICE_NAME`` in the service package. One spelling, because a
 # mismatch is a dead click rather than an error.
-HEALTH_LABEL = "Crawler"
+HEALTH_LABEL = "crawler"
 
 
 def get_spec() -> PluginSpec:

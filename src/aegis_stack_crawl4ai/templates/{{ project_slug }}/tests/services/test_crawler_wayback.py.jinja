@@ -12,10 +12,12 @@ from typing import Any
 import httpx
 import pytest
 
-from app.services.crawler import archive, queries
+from app.services.crawler import queries
+from app.services.crawler.domains import archive
+from app.services.crawler.domains.wayback import choose, enumerate_site
 from app.services.crawler.models import CrawledPage
-from app.services.crawler.options import CrawlOptions
-from app.services.crawler.wayback import choose, enumerate_site
+from app.services.crawler.schemas import CrawlOptions
+from app.services.crawler.utils import page_key
 
 CDX = [
     ["urlkey", "timestamp", "original"],
@@ -82,18 +84,20 @@ async def test_enumerate_lists_snapshot_urls_in_the_window() -> None:
 async def test_pages_already_stored_are_not_fetched_again(
     async_db_session: Any,
 ) -> None:
-    for url, status in (("http://a.test/", 200), ("http://a.test/post", 404)):
+    """A page is a page whatever host spelling or scheme reached it: the
+    live crawl files ``https://a.test/x``, the archive's original is
+    ``http://www.a.test/x``, and that is one page, already held."""
+    for url, status in (("https://a.test/", 200), ("https://a.test/post", 404)):
         async_db_session.add(
             CrawledPage(source_url=url, site="a.test", status_code=status)
         )
     await async_db_session.commit()
 
-    stored = await queries.stored_ok_urls(
-        async_db_session,
-        ["http://a.test/", "http://a.test/post", "http://a.test/new"],
-    )
+    held = await queries.site_page_keys(async_db_session, "a.test")
 
-    assert stored == {"http://a.test/"}
+    assert held == {"a.test/"}
+    assert page_key("http://www.a.test/") in held
+    assert page_key("http://www.a.test/post") not in held, "a 404 is not held"
 
 
 @pytest.mark.asyncio

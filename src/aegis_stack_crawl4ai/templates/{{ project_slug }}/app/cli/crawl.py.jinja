@@ -28,9 +28,13 @@ from app.components.backend.api.crawler import API_PREFIX
 from app.core.config import settings
 from app.core.constants import Defaults
 from app.core.formatting import format_bytes, format_relative_time
-from app.services.crawler.export import MANIFEST
-from app.services.crawler.options import MAX_DEPTH, CrawlOptions
-from app.services.crawler.schemas import CrawlSummary
+from app.services.crawler.domains.export import MANIFEST
+from app.services.crawler.schemas import (
+    MAX_DEPTH,
+    CrawlOptions,
+    CrawlSummary,
+    StoredExport,
+)
 
 app = typer.Typer(
     name="crawl",
@@ -288,17 +292,34 @@ async def assets(
     await _run_job(f"/sites/{site}/assets", {}, noun="asset")
 
 
-@app.command(help="Write a crawled site to a folder of plain files.")
+@app.command(help="Keep a crawled site's export in the object store, or unpack it.")
 async def export(
     site: str = typer.Argument(..., help="The site, as `crawl list` names it."),
-    directory: Path = typer.Argument(..., help="Where the files go."),
+    directory: Path | None = typer.Argument(
+        None, help="Unpack here instead of keeping the zip in the object store."
+    ),
 ) -> None:
     """Pages as HTML and markdown at their URL paths, assets at theirs,
-    and a manifest.json naming them all. Re-running overwrites."""
-    async with _client() as client:
-        resp = await client.get(
-            f"{API_PREFIX}/sites/{site}/export", timeout=httpx.Timeout(600.0)
+    and a manifest.json naming them all, as one zip. Its home is the
+    object store (the bucket), which outlives the stack; a directory is
+    for looking at it here. Re-running overwrites the directory."""
+    timeout = httpx.Timeout(600.0)
+    if directory is None:
+        async with _client() as client:
+            resp = await client.post(
+                f"{API_PREFIX}/sites/{site}/export", timeout=timeout
+            )
+            resp.raise_for_status()
+            kept = StoredExport.model_validate(resp.json())
+        console.print(
+            f"[green]✓[/green] {kept.pages} page(s), {kept.assets} asset(s), "
+            f"{format_bytes(kept.size)} → [cyan]{kept.key}[/cyan]"
         )
+        if kept.url:
+            console.print(f"[dim]{kept.url}[/dim]")
+        return
+    async with _client() as client:
+        resp = await client.get(f"{API_PREFIX}/sites/{site}/export", timeout=timeout)
         resp.raise_for_status()
     archive = zipfile.ZipFile(io.BytesIO(resp.content))
     archive.extractall(directory)

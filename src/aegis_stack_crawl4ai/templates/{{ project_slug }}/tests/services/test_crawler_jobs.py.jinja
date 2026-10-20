@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from app.services.crawler import dispatch
+from app.services.crawler import jobs
 from app.services.crawler.jobs import run_crawl
 from app.services.crawler.service import CrawlerService
 from app.services.system.jobs import get_job_runner
@@ -246,13 +246,13 @@ async def test_start_crawl_returns_a_job_the_runner_knows(
     """The id the endpoint returns has to be the id the SSE stream
     accepts, or the tab follows nothing. The in-process path, whichever
     the stack would pick."""
-    monkeypatch.setattr(dispatch, "_start", dispatch.start_in_process)
+    monkeypatch.setattr(jobs, "_start", jobs.start_in_process)
 
     async def fake_batch(*_args: Any, **_kwargs: Any) -> AsyncIterator[_Page]:
         yield _Page(200)
 
     monkeypatch.setattr(CrawlerService, "batch_fetch", fake_batch)
-    job_id = await dispatch.start_crawl(["https://a.test"])
+    job_id = await jobs.start_crawl(["https://a.test"])
     snapshot = await get_job_runner().wait(job_id)
 
     assert snapshot.status == "done", snapshot.error
@@ -275,7 +275,7 @@ class TestUrlNormalisation:
         ],
     )
     def test_a_missing_scheme_becomes_https(self, typed: str, expected: str) -> None:
-        from app.services.crawler.urls import normalize_url
+        from app.services.crawler.utils import normalize_url
 
         assert normalize_url(typed) == expected
 

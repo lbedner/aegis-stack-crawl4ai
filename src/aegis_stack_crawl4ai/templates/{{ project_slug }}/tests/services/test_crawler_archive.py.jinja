@@ -11,12 +11,13 @@ import asyncio
 from typing import Any
 
 import pytest
+from sqlalchemy import inspect
 
-from app.services.crawler import archive
-from app.services.crawler.archive import resolve
-from app.services.crawler.options import CrawlOptions
+from app.services.crawler.domains import archive
+from app.services.crawler.domains.archive import resolve
+from app.services.crawler.schemas import CrawlOptions
 from app.services.crawler.service import CrawlerService
-from app.services.crawler.urls import canonical_url
+from app.services.crawler.utils import canonical_url, page_key
 
 SNAPSHOT = "https://web.archive.org/web/20170911015439/http://a.test/post/"
 
@@ -113,6 +114,18 @@ class TestCanonicalUrl:
     def test_canonical_url(self, url: str, expected: str) -> None:
         assert canonical_url(url) == expected
 
+    @pytest.mark.parametrize(
+        "url",
+        ["https://a.test/x?p=2", "http://www.a.test/x?p=2", "HTTP://A.test:80/x?p=2"],
+    )
+    def test_page_key_names_one_page_whatever_reached_it(self, url: str) -> None:
+        """What the archive calls a page and what the live site calls it
+        differ by scheme and ``www``; neither makes a second page."""
+        assert page_key(url) == "a.test/x?p=2"
+
+    def test_page_key_keeps_a_subdomain(self) -> None:
+        assert page_key("http://blog.a.test/") == "blog.a.test/"
+
 
 @pytest.mark.asyncio
 async def test_a_page_keeps_its_html_beside_the_markdown(
@@ -126,6 +139,57 @@ async def test_a_page_keeps_its_html_beside_the_markdown(
     assert page.content == "# Hi"
     assert page.content_type == "markdown"
     assert page.html == "<h1>Hi</h1>"
+
+
+@pytest.mark.asyncio
+async def test_a_deduped_page_is_still_readable(async_db_session: Any) -> None:
+    """The row handed back on a hash match is read next by the assets
+    step, outside any transaction: its columns must be loaded, not
+    expired by the way the lookup's transaction was ended."""
+    service = CrawlerService()
+    first = await service._store(async_db_session, _Result(), url="https://a.test/")
+    again = await service._store(async_db_session, _Result(), url="https://a.test/")
+
+    assert again.id == first.id
+    assert "html" in inspect(again).dict, "expired: the next read would hit the DB"
+    assert again.html == "<h1>Hi</h1>"
+
+
+@pytest.mark.asyncio
+async def test_a_crawled_snapshot_keeps_its_archive_metadata(
+    async_db_session: Any,
+) -> None:
+    """A snapshot that comes back through ``crawl`` is still a snapshot:
+    filed under the original URL, marked ``wayback``, its timestamp kept
+    (the assets step and a retry both read it)."""
+    service = CrawlerService()
+    result = _Result()
+    result.url = SNAPSHOT  # type: ignore[attr-defined]
+
+    async def arun(**_: Any) -> Any:
+        return result
+
+    _fake_crawler(service, arun)
+
+    pages = [p async for p in service.crawl(async_db_session, url=SNAPSHOT)]
+
+    assert pages[0].source_url == "http://a.test/post/"
+    assert pages[0].source_kind == "wayback"
+    assert pages[0].doc_metadata["snapshot_ts"] == "20170911015439"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_page_leaves_no_transaction_open(
+    async_db_session: Any,
+) -> None:
+    """On SQLite an open transaction is the one write lock; a page that
+    has landed holds nothing while the next one is fetched."""
+    page = await CrawlerService()._store(
+        async_db_session, _Result(), url="https://a.test/"
+    )
+
+    assert page.id is not None
+    assert not async_db_session.in_transaction()
 
 
 @pytest.mark.asyncio

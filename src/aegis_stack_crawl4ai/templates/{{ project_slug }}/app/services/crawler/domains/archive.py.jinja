@@ -15,18 +15,18 @@ them rather than being stored as a failed page.
 from __future__ import annotations
 
 import asyncio
-import re
-import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+import re
+import time
 from typing import Any, TypeVar
 
 import httpx
 
 from app.core.config import settings
 from app.core.log import logger
-from app.services.crawler.urls import canonical_url
+from app.services.crawler.utils import canonical_url
 
 ARCHIVE_HOST = "web.archive.org"
 SOURCE_KIND = "wayback"
