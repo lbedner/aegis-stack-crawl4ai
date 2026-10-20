@@ -1,0 +1,13 @@
+{# Every site in the store; a row opens it in the drawer, the address
+   holds which. #}
+{% from "components/macros/layout.html" import card, drawer_sync %}
+{% from "components/macros/table.html" import data_table %}
+{% call card(None, id="crawler-sites-list") %}
+  {{ data_table([
+    {"key": "site", "label": "Site", "kind": "link", "target": "#overseer-main"},
+    {"key": "pages", "label": "Pages", "kind": "int", "align": "right"},
+    {"key": "failed", "label": "Failed", "kind": "int", "align": "right"},
+    {"key": "fetched", "label": "Last fetch"},
+  ], rows, empty="Nothing crawled yet") }}
+{% endcall %}
+{{ drawer_sync(open_drawer, drawer_param) }}

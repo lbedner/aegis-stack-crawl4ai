@@ -86,10 +86,15 @@ async def test_pages_already_stored_are_not_fetched_again(
 ) -> None:
     """A page is a page whatever host spelling or scheme reached it: the
     live crawl files ``https://a.test/x``, the archive's original is
-    ``http://www.a.test/x``, and that is one page, already held."""
-    for url, status in (("https://a.test/", 200), ("https://a.test/post", 404)):
+    ``http://www.a.test/x``, and that is one page, already held. Held
+    means kept: a 404, or a 200 that kept nothing, is asked for again."""
+    for url, status, html in (
+        ("https://a.test/", 200, "<p>kept</p>"),
+        ("https://a.test/post", 404, None),
+        ("https://a.test/empty", 200, None),
+    ):
         async_db_session.add(
-            CrawledPage(source_url=url, site="a.test", status_code=status)
+            CrawledPage(source_url=url, site="a.test", status_code=status, html=html)
         )
     await async_db_session.commit()
 
@@ -97,6 +102,7 @@ async def test_pages_already_stored_are_not_fetched_again(
 
     assert held == {"a.test/"}
     assert page_key("http://www.a.test/") in held
+    assert page_key("http://a.test/empty") not in held, "nothing kept is not held"
     assert page_key("http://www.a.test/post") not in held, "a 404 is not held"
 
 
@@ -122,3 +128,16 @@ async def test_a_listing_waits_out_the_archive_being_busy(
 
     assert len(urls) == 3
     assert len(naps) == 2 and naps[1] > naps[0]
+
+
+@pytest.mark.parametrize(
+    ("given", "kept"),
+    [("2017-05-01", "20170501"), ("2017", "2017"), ("20170501123000", "20170501123000")],
+)
+def test_a_calendar_date_is_the_archive_prefix(given: str, kept: str) -> None:
+    """The Overseer and the dashboard pick ISO dates; the CLI types
+    prefixes. Both reach the CDX query as the archive's own timestamp."""
+    from app.services.crawler.schemas import WaybackRequest
+
+    request = WaybackRequest(domain="a.test", from_ts=given, to_ts=given)
+    assert (request.from_ts, request.to_ts) == (kept, kept)

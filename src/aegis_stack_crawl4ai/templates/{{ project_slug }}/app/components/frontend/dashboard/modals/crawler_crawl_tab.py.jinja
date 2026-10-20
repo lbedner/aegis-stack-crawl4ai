@@ -1,4 +1,5 @@
-"""The Crawl tab: start a crawl, watch it, read what came back.
+"""The Crawl tab: start a crawl of live sites or of the Wayback
+Machine, watch it, read what came back.
 
 Its own module for the same reason the Pages tab is: the crawler modal
 is three independent tabs sharing a dialog. ``PagePreview`` lives here
@@ -24,10 +25,12 @@ from app.components.frontend.controls import (
     ThemedSwitch,
 )
 from app.components.frontend.controls.buttons import PulseButton
+from app.components.frontend.controls.form_fields import FormDateField
 from app.components.frontend.controls.jobs import JobOutcome, follow_job
 from app.components.frontend.dashboard.crawler_ui import (
     CRAWL_BATCH_ENDPOINT,
     PAGES_ENDPOINT,
+    WAYBACK_ENDPOINT,
     status_cell,
 )
 from app.components.frontend.state.session_state import get_session_state
@@ -38,9 +41,11 @@ from app.services.crawler.schemas import CrawledPageResult, CrawlOptions, CrawlS
 
 
 class CrawlTab(ft.Container):
-    """Start a crawl and watch it run.
+    """Start a crawl and watch it run: live sites from their seeds, or one
+    site as the Wayback Machine archived it (the htmx Overseer's Crawl
+    section asks the same two).
 
-    The URLs go out as one background job; progress comes back over the
+    The request goes out as one background job; progress comes back over the
     framework's own job stream, so nothing here polls and nothing here
     knows where the work runs. ``follow_job`` is the same control the
     page overlay and the documents pane sit on.
@@ -77,18 +82,17 @@ class CrawlTab(ft.Container):
             label="CSS selector", hint="main article", width=220
         )
         self._stay = ThemedSwitch(value=True)
-        self._start = PulseButton(
-            on_click_callable=self._start_crawl, text="Start crawl"
+        self._domain = FormTextField(label="Domain", hint="example.com")
+        self._from_ts = FormDateField(label="Captured from", width=180)
+        self._to_ts = FormDateField(label="Captured to", width=180)
+        self._include = FormTextField(
+            label="Include", hint="One glob per line", multiline=True, min_lines=2
         )
-        self._status = SecondaryText("")
-        self._summary = ft.Container()
-        # Fetched bodies, by page id. Toggling a row rebuilds the table,
-        # so without this every reopen would refetch.
-        self._bodies: dict[int, str] = {}
-
-        self.padding = Theme.Spacing.MD
-        self.expand = True
-        self.content = ft.Column(
+        self._exclude = FormTextField(
+            label="Exclude", hint="One glob per line", multiline=True, min_lines=2
+        )
+        self._assets = ThemedSwitch(value=False)
+        self._live_fields = ft.Column(
             [
                 self._urls,
                 ft.Row(
@@ -105,6 +109,63 @@ class CrawlTab(ft.Container):
                     wrap=True,
                     vertical_alignment=ft.CrossAxisAlignment.END,
                 ),
+            ],
+            spacing=Theme.Spacing.SM,
+        )
+        self._wayback_fields = ft.Column(
+            [
+                ft.Row(
+                    [self._domain, self._from_ts, self._to_ts],
+                    spacing=Theme.Spacing.MD,
+                    wrap=True,
+                ),
+                ft.Row(
+                    [
+                        ft.Container(self._include, expand=True),
+                        ft.Container(self._exclude, expand=True),
+                    ],
+                    spacing=Theme.Spacing.MD,
+                ),
+            ],
+            spacing=Theme.Spacing.SM,
+            visible=False,
+        )
+        self._mode = ft.RadioGroup(
+            value="site",
+            content=ft.Row(
+                [
+                    ft.Radio(value="site", label="Live site"),
+                    ft.Container(width=Theme.Spacing.LG),
+                    ft.Radio(value="wayback", label="Wayback Machine"),
+                ],
+            ),
+            on_change=self._on_mode_changed,
+        )
+        self._start = PulseButton(
+            on_click_callable=self._start_crawl, text="Start crawl"
+        )
+        self._status = SecondaryText("")
+        self._summary = ft.Container()
+        # Fetched bodies, by page id. Toggling a row rebuilds the table,
+        # so without this every reopen would refetch.
+        self._bodies: dict[int, str] = {}
+
+        self.padding = Theme.Spacing.MD
+        self.expand = True
+        self.content = ft.Column(
+            [
+                self._mode,
+                self._live_fields,
+                self._wayback_fields,
+                ft.Row(
+                    [
+                        self._assets,
+                        SecondaryText(
+                            "Fetch each page's images, stylesheets and downloads"
+                        ),
+                    ],
+                    spacing=Theme.Spacing.SM,
+                ),
                 ft.Row([self._start], alignment=ft.MainAxisAlignment.END),
                 ft.Container(content=self._status, padding=Theme.Spacing.SM),
                 self._summary,
@@ -113,10 +174,24 @@ class CrawlTab(ft.Container):
             scroll=ft.ScrollMode.AUTO,
         )
 
-    def _parse_urls(self) -> list[str]:
-        """One URL per line, blank lines ignored."""
-        raw = self._urls.value or ""
+    @property
+    def _wayback(self) -> bool:
+        return self._mode.value == "wayback"
+
+    def _on_mode_changed(self, _event: Any = None) -> None:
+        self._live_fields.visible = not self._wayback
+        self._wayback_fields.visible = self._wayback
+        with suppress(Exception):
+            self.update()
+
+    @staticmethod
+    def _lines(field: FormTextField) -> list[str]:
+        """One entry per line, blank lines ignored."""
+        raw = field.value or ""
         return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def _parse_urls(self) -> list[str]:
+        return self._lines(self._urls)
 
     def _options(self) -> CrawlOptions:
         """The form as the model every caller passes.
@@ -133,7 +208,34 @@ class CrawlTab(ft.Container):
             max_pages=max_pages or CrawlOptions().max_pages,
             stay_on_domain=bool(self._stay.value),
             selector=(self._selector.value or "").strip() or None,
+            assets=bool(self._assets.value),
         )
+
+    def _request(self) -> tuple[str, dict[str, Any]]:
+        """Where the form goes and what it says, in the shape the API
+        takes: a batch of seeds, or one archived domain."""
+        if not self._wayback:
+            return CRAWL_BATCH_ENDPOINT, {
+                "urls": self._parse_urls(),
+                "options": self._options().model_dump(),
+            }
+        options = CrawlOptions(
+            include=self._lines(self._include),
+            exclude=self._lines(self._exclude),
+            assets=bool(self._assets.value),
+        )
+        return WAYBACK_ENDPOINT, {
+            "domain": (self._domain.value or "").strip(),
+            "from_ts": (self._from_ts.value or "").strip() or None,
+            "to_ts": (self._to_ts.value or "").strip() or None,
+            "options": options.model_dump(),
+        }
+
+    def _missing(self) -> str | None:
+        """What the form still needs, said in the status line."""
+        if self._wayback:
+            return None if (self._domain.value or "").strip() else "Enter a domain."
+        return None if self._parse_urls() else "Enter at least one URL, one per line."
 
     def _say(self, message: str) -> None:
         self._status.value = message
@@ -150,20 +252,19 @@ class CrawlTab(ft.Container):
         """
         if self._running:
             return
-        urls = self._parse_urls()
-        if not urls:
-            self._say("Enter at least one URL, one per line.")
+        if missing := self._missing():
+            self._say(missing)
             return
 
         self._running = True
         self._set_button_enabled(False)
         self._summary.content = None
-        self._say(f"Starting {len(urls)} URL(s)...")
+        self._say("Starting...")
 
         try:
-            outcome = await self._run(urls)
+            outcome = await self._run()
         except Exception as exc:  # noqa: BLE001 - the status line is the only place the user can see this
-            logger.exception("crawler.tab.start_failed", url_count=len(urls))
+            logger.exception("crawler.tab.start_failed", wayback=self._wayback)
             self._say(f"Could not start the crawl: {exc}")
             return
         finally:
@@ -179,21 +280,21 @@ class CrawlTab(ft.Container):
         self._say("Done.")
         await self._on_finished()
 
-    async def _run(self, urls: list[str]) -> JobOutcome | None:
+    async def _run(self) -> JobOutcome | None:
         """Start the job and follow it. None when the server started none."""
         api = get_session_state(self._page).api_client
-        started = await api.post(
-            CRAWL_BATCH_ENDPOINT,
-            json={"urls": urls, "options": self._options().model_dump()},
-        )
+        endpoint, body = self._request()
+        started = await api.post(endpoint, json=body)
         job_id = started.get("job_id") if isinstance(started, dict) else None
         if not job_id:
             # ``api_client`` swallows the status code and logs it, so the
             # reason is in the server log, not here. Name the one cause a
             # user can act on.
             self._say(
-                "The server refused those URLs. Check each line is a web "
-                "address."
+                "The server refused that. Check the domain."
+                if self._wayback
+                else "The server refused those URLs. Check each line is a "
+                "web address."
             )
             return None
         self._say("Queued. Waiting for the first page...")

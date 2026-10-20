@@ -22,8 +22,8 @@ That will:
 
 - Add `crawl4ai>=0.8.6` and `alembic>=1.13` to your project's `pyproject.toml`
 - Render the service (`app/services/crawler/`), its router
-  (`app/components/backend/api/crawler/`), the dashboard card and modal, and a
-  `crawl` CLI
+  (`app/components/backend/api/crawler/`), the dashboard card and modal, the
+  htmx Overseer's Crawler page (on stacks with `htmx`), and a `crawl` CLI
 - Generate an Alembic migration creating `crawler.crawled_page`
 - Mount the routes below under `/api/v1/crawler`
 - Add a `Crawler` row to the dashboard health table, with its own card and modal
@@ -39,10 +39,17 @@ Crawl4AI 0.8.5 and earlier pull in a transitive `litellm` dependency that was
 
 ## What you get
 
-**Dashboard.** A Crawler card, and a modal with three tabs. *Overview* is the counts.
-*Pages* drills down: the sites you have crawled, then that site's pages, then one page's
-stored body with a copy button. *Crawl* starts a crawl and watches it run, with a row per
-page as it lands.
+**Dashboard and Overseer.** The same things on both frontends: a Crawler card and modal
+on the Flet dashboard, and a Crawler page on the htmx Overseer (Overview, Sites, Pages,
+Crawl), at the rail entry the generic status page would otherwise take.
+
+- *Overview* is the counts.
+- *Sites* are the sites you have crawled. A site narrows its pages to the failed, exports
+  as a zip of plain files, and fetches the assets its pages name.
+- *Pages* open on their markdown, their raw HTML and their assets.
+- *Crawl* starts a crawl of live sites (seeds, depth, max pages, a CSS selector) or of
+  one site from the Wayback Machine (domain, from/to, include/exclude globs), either with
+  assets, and follows the job while it runs.
 
 **API.** Six routes under `/api/v1/crawler`:
 
@@ -333,6 +340,10 @@ aegis-stack-crawl4ai/
 │       │   ├── crawler_ui.py             # names, routes and cells the surfaces share
 │       │   ├── cards/crawler_card.py
 │       │   └── modals/crawler_*.py       # modal, pages tab, crawl tab
+│       ├── app/components/web_frontend/  # htmx stacks only
+│       │   ├── overseer_crawler.py       # the Overseer page's sections
+│       │   ├── routes/partials/overseer_crawler.py  # its drawers and actions
+│       │   └── templates/pages/overseer/crawler/
 │       ├── app/cli/crawl.py              # crawl commands
 │       └── tests/                        # shipped into the project and run there
 └── tests/

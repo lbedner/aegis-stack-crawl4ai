@@ -1,0 +1,21 @@
+{# One stored page in the drawer: what was fetched, its markdown and raw
+   HTML, and the assets it names. #}
+{% from "components/macros/layout.html" import badge, card, code_block, dialog_title, facts, tabbed, tab_panel %}
+{% from "components/macros/table.html" import data_table %}
+<div class="space-y-4">
+  {{ dialog_title(page.source_url) }}
+  <div class="flex items-center gap-2">{{ badge(status.label, status.tone) }}<a href="{{ page.source_url }}" target="_blank" rel="noopener" class="text-xs text-aegis-muted hover:text-aegis-teal">Open the original</a></div>
+  {% call card("Details", id="crawler-page-facts") %}{{ facts(details) }}{% endcall %}
+  {% call tabbed("crawler-page", [("markdown", "Markdown"), ("html", "HTML"), ("assets", "Assets (" ~ assets|length ~ ")")]) %}
+    {% call tab_panel("markdown", "markdown") %}{% if page.content %}{{ code_block(page.content, wrap=True) }}{% else %}<p class="text-xs text-aegis-muted">No markdown stored.</p>{% endif %}{% endcall %}
+    {% call tab_panel("html", "markdown") %}{% if page.html %}{{ code_block(page.html, wrap=True) }}{% else %}<p class="text-xs text-aegis-muted">No HTML stored.</p>{% endif %}{% endcall %}
+    {% call tab_panel("assets", "markdown") %}
+      {{ data_table([
+        {"key": "url", "label": "URL", "kind": "code"},
+        {"key": "type", "label": "Type"},
+        {"key": "size", "label": "Size", "align": "right"},
+        {"key": "status", "label": "Status", "kind": "status"},
+      ], assets, empty="No assets on this page") }}
+    {% endcall %}
+  {% endcall %}
+</div>

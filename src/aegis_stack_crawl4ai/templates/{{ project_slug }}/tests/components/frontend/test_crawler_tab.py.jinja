@@ -37,7 +37,7 @@ async def test_a_failure_lands_in_the_status_line() -> None:
     tab = _tab()
     tab._urls.value = "https://a.test"
 
-    async def boom(_urls: list[str]) -> Any:
+    async def boom() -> Any:
         raise RuntimeError("the API is down")
 
     tab._run = boom  # type: ignore[method-assign]
@@ -82,6 +82,54 @@ class TestOptions:
         tab = _tab()
         tab._max_pages.value = "lots"
         assert tab._options().max_pages == CrawlOptions().max_pages
+
+
+class TestWayback:
+    """The second mode: one site as the archive kept it, posted to the
+    wayback route in the shape ``WaybackRequest`` takes."""
+
+    def test_a_live_crawl_goes_to_the_batch_route_with_assets(self) -> None:
+        from app.components.frontend.dashboard.crawler_ui import CRAWL_BATCH_ENDPOINT
+
+        tab = _tab()
+        tab._urls.value = "https://a.test"
+        tab._assets.value = True
+        endpoint, body = tab._request()
+        assert endpoint == CRAWL_BATCH_ENDPOINT
+        assert body["urls"] == ["https://a.test"]
+        assert body["options"]["assets"] is True
+
+    def test_the_archive_pull_takes_its_window_and_globs(self) -> None:
+        from app.components.frontend.dashboard.crawler_ui import WAYBACK_ENDPOINT
+        from app.services.crawler.schemas import WaybackRequest
+
+        tab = _tab()
+        tab._mode.value = "wayback"
+        tab._domain.value = " theroseofeternity.com "
+        tab._from_ts.value = "2017-05-01"
+        tab._exclude.value = "*/feed/*\n\n"
+        endpoint, body = tab._request()
+        assert endpoint == WAYBACK_ENDPOINT
+        request = WaybackRequest.model_validate(body)
+        assert (request.domain, request.from_ts, request.to_ts) == (
+            "theroseofeternity.com",
+            "20170501",
+            None,
+        )
+        assert request.options.exclude == ["*/feed/*"]
+
+    @pytest.mark.asyncio
+    async def test_an_archive_pull_needs_a_domain(self) -> None:
+        tab = _tab()
+        tab._mode.value = "wayback"
+        await tab._start.on_click(None)
+        assert tab._status.value == "Enter a domain."
+
+    def test_switching_mode_swaps_the_fields(self) -> None:
+        tab = _tab()
+        tab._mode.value = "wayback"
+        tab._on_mode_changed()
+        assert tab._wayback_fields.visible and not tab._live_fields.visible
 
 
 class TestLazyPageBody:
@@ -210,6 +258,35 @@ class TestDrillDown:
         assert body.scroll is None
         assert [c for c in _walk(body) if getattr(c, "scroll", None) is not None]
 
+    def test_a_page_opens_on_markdown_html_and_assets(self) -> None:
+        tab = self._tab()
+        tab._pages = [{"id": 4, "source_url": "https://a.test/x", "content": "md"}]
+        tab._open_page(0)
+        tab._html = "<h1>x</h1>"
+        tab._assets = [
+            {"original_url": "https://a.test/logo.png", "size": 10, "storage_key": "k"}
+        ]
+        (tabs,) = [c for c in _walk(tab._content_view()) if hasattr(c, "tabs")]
+        assert [t.text for t in tabs.tabs] == ["Markdown", "HTML", "Assets (1)"]
+        texts = [getattr(c, "value", None) for c in _walk(tabs)]
+        assert "md" in texts and "<h1>x</h1>" in texts
+
+    def test_a_site_narrows_to_its_failed_pages(self) -> None:
+        """The filter only says so; the next refresh asks for them."""
+        tab = self._tab()
+        tab._open_site(0)
+        tab._failed_only.value = True
+        assert tab._failed_only in list(_walk(tab._pages_view()))
+
+    @pytest.mark.asyncio
+    async def test_export_hands_the_browser_the_zip_route(self) -> None:
+        opened: list[str] = []
+        tab = self._tab()
+        tab._page.launch_url = opened.append
+        tab._site = "rose of.test"
+        await tab._export()
+        assert opened == ["/api/v1/crawler/sites/rose%20of.test/export"]
+
     def test_back_from_a_page_returns_to_its_pages(self) -> None:
         tab = self._tab()
         tab._open_site(0)
@@ -226,5 +303,8 @@ def _walk(control: Any) -> Any:
     content = getattr(control, "content", None)
     if content is not None:
         yield from _walk(content)
-    for child in getattr(control, "controls", None) or []:
+    for child in [
+        *(getattr(control, "controls", None) or []),
+        *(getattr(control, "tabs", None) or []),
+    ]:
         yield from _walk(child)

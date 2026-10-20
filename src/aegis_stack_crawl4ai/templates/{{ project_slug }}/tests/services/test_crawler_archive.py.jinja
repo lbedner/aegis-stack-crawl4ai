@@ -141,6 +141,45 @@ async def test_a_page_keeps_its_html_beside_the_markdown(
     assert page.html == "<h1>Hi</h1>"
 
 
+class _Flagged:
+    """What crawl4ai hands back for a page its block heuristic fails: the
+    host answered 200, the bytes are there, ``success`` is not."""
+
+    success = False
+    status_code = 200
+    html = "<script>var menu = [];</script>"
+    markdown = ""
+    metadata: dict[str, Any] = {}
+    error_message = "Blocked by anti-bot protection: Structural: no <body> tag"
+
+
+@pytest.mark.asyncio
+async def test_a_page_the_host_served_keeps_its_bytes_when_flagged(
+    async_db_session: Any,
+) -> None:
+    """An archived frame or script has no <body>; crawl4ai calls that a
+    block page. The archive served it, so it is kept, verdict and all."""
+    page = await CrawlerService()._store(async_db_session, _Flagged(), url=SNAPSHOT)
+
+    assert page.status_code == 200
+    assert page.html == page.content == "<script>var menu = [];</script>"
+    assert page.content_hash
+    assert page.doc_metadata["flagged"].startswith("Blocked by anti-bot")
+
+
+@pytest.mark.asyncio
+async def test_a_refused_page_keeps_nothing(async_db_session: Any) -> None:
+    """A 404 has no page to keep, whatever its body says."""
+
+    class _Missing(_Flagged):
+        status_code = 404
+
+    page = await CrawlerService()._store(async_db_session, _Missing(), url=SNAPSHOT)
+
+    assert (page.status_code, page.html, page.content) == (404, None, None)
+    assert "flagged" not in page.doc_metadata
+
+
 @pytest.mark.asyncio
 async def test_a_deduped_page_is_still_readable(async_db_session: Any) -> None:
     """The row handed back on a hash match is read next by the assets
@@ -246,6 +285,49 @@ async def test_a_host_that_stays_busy_is_a_stored_failure(
 
     assert outcome.success is False
     assert len(_fresh_clock) == settings.CRAWLER_RETRY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_connection_is_waited_out(
+    _fresh_clock: list[float],
+) -> None:
+    """archive.org hangs up when busy, as surely as it answers 503: the
+    CDX listing of a large site died on the first one."""
+    import httpx
+
+    calls = 0
+
+    async def call() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise httpx.RemoteProtocolError("Server disconnected")
+        return "listing"
+
+    outcome = await archive.patiently("a.test", call, lambda _r: False)
+
+    assert outcome == "listing"
+    assert len(_fresh_clock) == 2, "it backed off before each retry"
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_keeps_hanging_up_raises() -> None:
+    """With the retries spent there is no answer to store: the job fails
+    with the reason."""
+    import httpx
+
+    from app.core.config import settings
+
+    calls = 0
+
+    async def call() -> str:
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("Server disconnected")
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        await archive.patiently("a.test", call, lambda _r: False)
+    assert calls == settings.CRAWLER_RETRY_LIMIT + 1
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ metadata and appends the version.
 """
 
 from typing import Any
+from urllib.parse import quote
 
 import flet as ft
 
@@ -26,6 +27,12 @@ STATS_ENDPOINT = f"{API_PREFIX}/stats"
 SITES_ENDPOINT = f"{API_PREFIX}/sites"
 PAGES_ENDPOINT = f"{API_PREFIX}/pages"
 CRAWL_BATCH_ENDPOINT = f"{API_PREFIX}/crawl-batch"
+WAYBACK_ENDPOINT = f"{API_PREFIX}/wayback"
+
+
+def site_endpoint(site: str, action: str) -> str:
+    """One site's ``export`` (a zip) or ``assets`` (start their fetch)."""
+    return f"{SITES_ENDPOINT}/{quote(site, safe='')}/{action}"
 
 
 def status_cell(status_code: Any) -> ft.Control:
