@@ -49,19 +49,20 @@ def get_spec() -> PluginSpec:
         description="Web crawling and scraping via Crawl4AI",
         version="0.1.0",
         verified=False,
-        # PEP 440 specifier. The plugin's worker queue is written in the
-        # 0.15 shape (``arq_hooks.for_queue``, ``concurrency_for``, the
-        # pausable TaskIQ broker), so anything older imports a queue
-        # module that fails on the first line.
-        aegis_version=">=0.15.1",
+        # PEP 440 specifier. 0.16 is the framework that runs a plugin's
+        # queue as its own ``worker-<queue>`` container; on anything older
+        # a crawl in a worker stack sits queued with no process to take it.
+        aegis_version=">=0.16.0",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.
         cli_name="crawl",
         # Resolver auto-installs database if missing.
         required_components=["database"],
-        # With a worker, crawls run there and survive a webserver restart.
+        # With a worker, crawls run there and survive a webserver restart,
+        # on the plugin's own queue in its own ``worker-crawler`` process.
         recommended_components=["worker"],
+        worker_queues=["crawler"],
         # Pinned to >=0.8.6 because 0.8.6 is the supply-chain hotfix
         # that swapped the compromised ``litellm`` package out — earlier
         # 0.8.x builds pull the bad transitive dep.
