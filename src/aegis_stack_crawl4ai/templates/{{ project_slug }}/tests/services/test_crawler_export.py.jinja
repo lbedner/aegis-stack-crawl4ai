@@ -14,7 +14,7 @@ import zipfile
 import pytest
 
 from app.core.storage import FilesystemStorage, get_storage, set_storage
-from app.services.crawler.export import export_site, file_path
+from app.services.crawler.domains.export import export_site, file_path, store_export
 from app.services.crawler.models import CrawledAsset, CrawledPage
 
 
@@ -30,7 +30,9 @@ class TestFilePath:
             ("http://a.test/images/menu.gif", "images/menu.gif"),
         ],
     )
-    def test_a_url_becomes_a_path_inside_the_folder(self, url: str, expected: str) -> None:
+    def test_a_url_becomes_a_path_inside_the_folder(
+        self, url: str, expected: str
+    ) -> None:
         assert file_path(url) == expected
 
 
@@ -47,24 +49,40 @@ async def test_a_site_exports_to_the_expected_tree(
 ) -> None:
     key = await get_storage().put(b"GIF89a", content_type="image/gif")
     stale = CrawledPage(
-        source_url="http://a.test/", site="a.test", content="old", html="<p>old</p>",
-        content_type="markdown", status_code=200,
+        source_url="http://a.test/",
+        site="a.test",
+        content="old",
+        html="<p>old</p>",
+        content_type="markdown",
+        status_code=200,
     )
     home = CrawledPage(
-        source_url="http://a.test/", site="a.test", content="# Home",
-        html="<h1>Home</h1>", content_type="markdown", content_hash="h1",
-        status_code=200, doc_metadata={"snapshot_ts": "20170911015439"},
+        source_url="http://a.test/",
+        site="a.test",
+        content="# Home",
+        html="<h1>Home</h1>",
+        content_type="markdown",
+        content_hash="h1",
+        status_code=200,
+        doc_metadata={"snapshot_ts": "20170911015439"},
     )
     post = CrawledPage(
-        source_url="http://a.test/journal/may_2005.htm", site="a.test",
-        content="# May", html="<h1>May</h1>", content_type="markdown",
-        content_hash="h2", status_code=200,
+        source_url="http://a.test/journal/may_2005.htm",
+        site="a.test",
+        content="# May",
+        html="<h1>May</h1>",
+        content_type="markdown",
+        content_hash="h2",
+        status_code=200,
     )
     gone = CrawledPage(
         source_url="http://a.test/missing", site="a.test", status_code=404
     )
     other = CrawledPage(
-        source_url="http://b.test/", site="b.test", content="x", html="x",
+        source_url="http://b.test/",
+        site="b.test",
+        content="x",
+        html="x",
         status_code=200,
     )
     for row in (stale, home, post, gone, other):
@@ -73,26 +91,42 @@ async def test_a_site_exports_to_the_expected_tree(
     await async_db_session.refresh(home)
     async_db_session.add(
         CrawledAsset(
-            page_id=home.id, site="a.test", original_url="http://a.test/images/menu.gif",
-            content_type="image/gif", size=6, storage_key=key, status_code=200,
+            page_id=home.id,
+            site="a.test",
+            original_url="http://a.test/images/menu.gif",
+            content_type="image/gif",
+            size=6,
+            storage_key=key,
+            status_code=200,
         )
     )
     async_db_session.add(
         CrawledAsset(
-            page_id=home.id, site="a.test", original_url="http://a.test/images/lost.gif",
+            page_id=home.id,
+            site="a.test",
+            original_url="http://a.test/images/lost.gif",
             status_code=404,
         )
     )
     async_db_session.add(
         CrawledAsset(
-            page_id=home.id, site="a.test", original_url="http://cdn.a.test/x.gif",
-            content_type="image/gif", size=6, storage_key=key, status_code=200,
+            page_id=home.id,
+            site="a.test",
+            original_url="http://cdn.a.test/x.gif",
+            content_type="image/gif",
+            size=6,
+            storage_key=key,
+            status_code=200,
         )
     )
     async_db_session.add(
         CrawledAsset(
-            page_id=home.id, site="a.test", original_url="http://a.test/gone.gif",
-            content_type="image/gif", size=1, status_code=200,
+            page_id=home.id,
+            site="a.test",
+            original_url="http://a.test/gone.gif",
+            content_type="image/gif",
+            size=1,
+            status_code=200,
             storage_key="sha256/00/00/" + "0" * 64,
         )
     )
@@ -128,3 +162,76 @@ async def test_a_site_exports_to_the_expected_tree(
     ]
     assert manifest["assets"][0]["storage_key"] == key
     assert manifest["missing"] == ["http://a.test/gone.gif"]
+
+
+@pytest.mark.asyncio
+async def test_an_export_is_kept_in_the_object_store(
+    async_db_session: Any, store: Any
+) -> None:
+    """The stack is disposable; the bucket is not. The export's home is
+    the object store, under its content key: the pages and the manifest,
+    the assets named by the keys they already sit under in that store,
+    not copied in beside themselves."""
+    key = await get_storage().put(b"GIF89a", content_type="image/gif")
+    home = CrawledPage(
+        source_url="http://a.test/", site="a.test", html="x", status_code=200
+    )
+    async_db_session.add(home)
+    await async_db_session.commit()
+    async_db_session.add(
+        CrawledAsset(
+            page_id=home.id,
+            site="a.test",
+            original_url="http://a.test/menu.gif",
+            storage_key=key,
+            status_code=200,
+        )
+    )
+    await async_db_session.commit()
+
+    kept = await store_export(async_db_session, "a.test")
+
+    data = await get_storage().get(kept.key)
+    assert data is not None and kept.size == len(data)
+    archive = zipfile.ZipFile(io.BytesIO(data))
+    assert sorted(archive.namelist()) == ["index.html", "index.md", "manifest.json"]
+    manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["site"] == "a.test"
+    assert [(a["path"], a["storage_key"]) for a in manifest["assets"]] == [
+        ("menu.gif", key)
+    ]
+    assert (kept.site, kept.pages, kept.assets) == ("a.test", 1, 1)
+    assert kept.url is None, "a filesystem store has no link to hand out"
+
+
+@pytest.mark.asyncio
+async def test_the_live_copy_of_a_page_beats_the_archived_one(
+    async_db_session: Any, store: Any
+) -> None:
+    """The live site and the archive spell one page two ways, so a site
+    pulled from both holds it twice. The folder has one path for it,
+    and the live fetch is the one that goes there."""
+    archived = CrawledPage(
+        source_url="http://www.a.test/x.htm",
+        site="a.test",
+        content="old",
+        html="<p>archive</p>",
+        status_code=200,
+        source_kind="wayback",
+    )
+    live = CrawledPage(
+        source_url="https://a.test/x.htm",
+        site="a.test",
+        content="new",
+        html="<p>live</p>",
+        status_code=200,
+    )
+    async_db_session.add_all([live, archived])
+    await async_db_session.commit()
+
+    archive = zipfile.ZipFile(io.BytesIO(await export_site(async_db_session, "a.test")))
+
+    assert sorted(archive.namelist()) == ["manifest.json", "x.htm", "x.md"]
+    assert archive.read("x.htm") == b"<p>live</p>"
+    manifest = json.loads(archive.read("manifest.json"))
+    assert [p["source_url"] for p in manifest["pages"]] == ["https://a.test/x.htm"]

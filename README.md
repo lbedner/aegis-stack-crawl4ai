@@ -173,7 +173,7 @@ write-path branch.
 ```python
 from app.core.db import AsyncSessionLocal
 from app.services.crawler.deps import get_crawler
-from app.services.crawler.options import CrawlOptions
+from app.services.crawler.schemas import CrawlOptions
 
 crawler = get_crawler()  # process-wide instance; the API and health check share it
 
@@ -315,15 +315,18 @@ aegis-stack-crawl4ai/
 │       ├── app/services/crawler/
 │       │   ├── service.py                # AsyncWebCrawler wrapper
 │       │   ├── queries.py                # every read, so an N+1 audit is one file
-│       │   ├── models.py                 # CrawledPage SQLModel
-│       │   ├── schemas.py                # Pydantic request / response
-│       │   ├── options.py                # CrawlOptions, the shared knobs
-│       │   ├── urls.py                   # bare domain -> fetchable URL
-│       │   ├── jobs.py                   # what a crawl job does
-│       │   ├── dispatch.py               # where it runs
+│       │   ├── models.py                 # CrawledPage, CrawledAsset SQLModels
+│       │   ├── schemas.py                # CrawlOptions, request / response models
+│       │   ├── utils.py                  # URL helpers: fetchable, canonical, site
+│       │   ├── jobs.py                   # what a crawl job does, and where it runs
 │       │   ├── deps.py                   # FastAPI DI, one crawler per process
 │       │   ├── settings.py               # settings mixin (leaf module)
-│       │   └── health.py                 # dashboard health check
+│       │   ├── health.py                 # dashboard health check
+│       │   └── domains/                  # the subsystems
+│       │       ├── archive.py            # Wayback snapshots, paced and retried
+│       │       ├── wayback.py            # a site listed from the CDX index
+│       │       ├── assets.py             # a page's images, scripts, downloads
+│       │       └── export.py             # a site as a folder of plain files
 │       ├── app/components/backend/api/crawler/
 │       │   └── router.py                 # FastAPI router
 │       ├── app/components/frontend/dashboard/

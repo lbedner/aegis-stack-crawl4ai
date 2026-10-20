@@ -184,8 +184,8 @@ class TestWiring:
         spec = get_spec()
         card = next(c for c in spec.wiring.dashboard_cards if c.symbol == "CrawlerCard")
         # ``modal_id`` doubles as the dashboard dispatch key. Match the
-        # health-check label so ``service_Crawler`` routes to this card.
-        assert card.modal_id == "Crawler"
+        # health-check label so ``service_crawler`` routes to this card.
+        assert card.modal_id == "crawler"
         health = next(h for h in spec.wiring.health_checks)
         assert card.modal_id == health.label, (
             "the card dispatch key is the health label"
@@ -205,7 +205,7 @@ class TestWiring:
         assert modal.module == (
             "app.components.frontend.dashboard.modals.crawler_modal"
         )
-        assert modal.modal_id == "service_Crawler"
+        assert modal.modal_id == "service_crawler"
         health = next(h for h in spec.wiring.health_checks)
         assert modal.modal_id == f"service_{health.label}", (
             "the modal registers under service_<health label>"

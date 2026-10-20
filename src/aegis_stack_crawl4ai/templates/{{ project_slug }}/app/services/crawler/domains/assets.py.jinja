@@ -10,7 +10,6 @@ did, and archive.org's turn applies.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin
@@ -18,10 +17,11 @@ from urllib.parse import urljoin
 import httpx
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.db import release_lock
 from app.core.log import logger
 from app.core.storage import get_storage
 from app.services.crawler import queries
-from app.services.crawler.archive import (
+from app.services.crawler.domains.archive import (
     THROTTLED,
     http_client,
     patiently,
@@ -29,8 +29,7 @@ from app.services.crawler.archive import (
     snapshot_url,
 )
 from app.services.crawler.models import CrawledAsset, CrawledPage
-from app.services.crawler.options import same_site, site_of
-from app.services.crawler.urls import canonical_url
+from app.services.crawler.utils import canonical_url, same_site, site_of
 
 # A link is an asset when it points at a file, not a page.
 DOWNLOAD_SUFFIXES = (
@@ -87,20 +86,27 @@ async def _fetch_one(
     client: httpx.AsyncClient, page: CrawledPage, url: str
 ) -> CrawledAsset:
     fetch_url = _fetch_url(page, url)
-    response = await patiently(
-        site_of(fetch_url) or "",
-        lambda: client.get(fetch_url, follow_redirects=True),
-        lambda r: r.status_code in THROTTLED,
-    )
     asset = CrawledAsset(
         page_id=page.id,
         site=str(page.site),
         original_url=url,
-        status_code=response.status_code,
-        content_type=response.headers.get("content-type", "").split(";")[0] or None,
-        size=len(response.content),
         fetched_at=datetime.now(UTC),
     )
+    try:
+        response = await patiently(
+            site_of(fetch_url) or "",
+            lambda: client.get(fetch_url, follow_redirects=True),
+            lambda r: r.status_code in THROTTLED,
+        )
+    except httpx.HTTPError as exc:
+        # A timeout or a refused connection: a failed row, as a page's
+        # would be, and not settled, so a later pass asks again.
+        asset.status_code = 599
+        logger.warning("crawler.asset failed url=%s error=%s", url, exc)
+        return asset
+    asset.status_code = response.status_code
+    asset.content_type = response.headers.get("content-type", "").split(";")[0] or None
+    asset.size = len(response.content)
     if response.is_success:
         asset.storage_key = await get_storage().put(
             response.content, content_type=asset.content_type
@@ -123,6 +129,8 @@ async def fetch_assets(
     site = str(page.site)
     wanted = discover(page.html, page.source_url)
     known = await queries.stored_asset_urls(session, site, wanted)
+    # The lookup took the write lock; the downloads need no database.
+    await release_lock(session)
     todo = [u for u in wanted if u not in known and (site, u) not in _inflight]
     if not todo:
         return []

@@ -16,6 +16,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.services.crawler.models import CrawledAsset, CrawledPage
+from app.services.crawler.utils import page_key
 
 _FAILED = or_(
     CrawledPage.status_code.is_(None),
@@ -76,9 +77,13 @@ async def _present(
     return found
 
 
-async def stored_ok_urls(db: AsyncSession, urls: list[str]) -> set[str]:
-    """Which of ``urls`` the store already holds a successful fetch of."""
-    return await _present(db, CrawledPage.source_url, urls, not_(_FAILED))
+async def site_page_keys(db: AsyncSession, site: str) -> set[str]:
+    """The pages a site holds a successful fetch of, as ``page_key``s, so
+    the archive's spelling of a page the live crawl stored is held too."""
+    rows = await db.exec(
+        select(CrawledPage.source_url).where(CrawledPage.site == site, not_(_FAILED))
+    )
+    return {page_key(str(url)) for url in rows.all()}
 
 
 async def stored_asset_urls(db: AsyncSession, site: str, urls: list[str]) -> set[str]:

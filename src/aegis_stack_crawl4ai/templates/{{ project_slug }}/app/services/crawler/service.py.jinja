@@ -18,9 +18,9 @@ path branch.
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+import re
 from typing import Any
 
 from crawl4ai import (
@@ -36,11 +36,11 @@ from app.core.config import settings
 from app.core.log import logger
 from app.core.storage import content_key
 from app.services.crawler import queries
-from app.services.crawler.assets import fetch_assets
-from app.services.crawler.archive import THROTTLED, paced, patiently, resolve
+from app.services.crawler.domains.archive import THROTTLED, paced, patiently, resolve
+from app.services.crawler.domains.assets import fetch_assets
 from app.services.crawler.models import CrawledPage
-from app.services.crawler.options import CrawlOptions, same_site, site_of
-from app.services.crawler.schemas import CrawlerSite, CrawlerStats
+from app.services.crawler.schemas import CrawlerSite, CrawlerStats, CrawlOptions
+from app.services.crawler.utils import same_site, site_of
 from app.services.system.activity import add_event
 
 
@@ -242,7 +242,10 @@ class CrawlerService:
         outcome = await self._run(url, options)
         seed = resolve(url).url
         async for result in _each(outcome):
-            found = resolve(str(getattr(result, "url", "") or url)).url
+            # Stored as it was reached: a snapshot URL keeps its archive
+            # metadata through ``_store``'s own resolve.
+            reached = str(getattr(result, "url", "") or url)
+            found = resolve(reached).url
             offsite = options.stay_on_domain and not same_site(seed, found)
             if offsite or (found != seed and not options.allows(found)):
                 logger.debug("crawler.crawl.skipped url=%s seed=%s", found, url)
@@ -250,7 +253,7 @@ class CrawlerService:
             page = await self._store(
                 session,
                 result,
-                url=found,
+                url=reached,
                 doc_metadata=doc_metadata,
                 source_kind=source_kind,
                 fresh=options.fresh,
@@ -344,8 +347,10 @@ class CrawlerService:
                     details=f"hash match → returning row #{existing.id}",
                 )
                 # The lookup opened a transaction; end it, or the connection
-                # sits idle in it through the next fetch's waits.
-                await session.rollback()
+                # sits idle in it through the next fetch's waits. A commit,
+                # not a rollback: a rollback expires the row, and the assets
+                # step reads it next, outside any transaction.
+                await session.commit()
                 return existing
 
         document = CrawledPage(
@@ -365,8 +370,10 @@ class CrawlerService:
             fetched_at=datetime.now(UTC),
         )
         session.add(document)
+        # No refresh after the commit: the session keeps its attributes
+        # (expire_on_commit is off), and a refresh would open a new
+        # transaction, SQLite's write lock, that outlives this page.
         await session.commit()
-        await session.refresh(document)
 
         # Surface every fetch in the dashboard activity feed.
         # Same convention every in-tree service uses (auth login,

@@ -12,14 +12,14 @@ from collections.abc import Iterable
 
 import httpx
 
-from app.services.crawler.archive import (
+from app.services.crawler.domains.archive import (
     ARCHIVE_HOST,
     THROTTLED,
     http_client,
     patiently,
     snapshot_url,
 )
-from app.services.crawler.options import CrawlOptions
+from app.services.crawler.schemas import CrawlOptions
 
 CDX_URL = f"https://{ARCHIVE_HOST}/cdx/search/cdx"
 

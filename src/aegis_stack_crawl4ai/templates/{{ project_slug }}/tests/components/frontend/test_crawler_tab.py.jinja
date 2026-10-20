@@ -77,7 +77,7 @@ class TestOptions:
         assert options.stay_on_domain is False
 
     def test_a_bad_page_count_falls_back(self) -> None:
-        from app.services.crawler.options import CrawlOptions
+        from app.services.crawler.schemas import CrawlOptions
 
         tab = _tab()
         tab._max_pages.value = "lots"

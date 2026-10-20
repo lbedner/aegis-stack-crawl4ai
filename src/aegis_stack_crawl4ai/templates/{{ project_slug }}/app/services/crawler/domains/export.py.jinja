@@ -16,19 +16,27 @@ from __future__ import annotations
 
 import io
 import json
-import zipfile
 from typing import Any
 from urllib.parse import urlsplit
+import zipfile
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.log import logger
 from app.core.storage import get_storage
 from app.services.crawler import queries
-from app.services.crawler.options import site_of
-from app.services.crawler.schemas import CrawledAssetRead, CrawledPageSummary
+from app.services.crawler.domains.archive import SOURCE_KIND
+from app.services.crawler.schemas import (
+    CrawledAssetRead,
+    CrawledPageSummary,
+    StoredExport,
+)
+from app.services.crawler.utils import site_of
 
 MANIFEST = "manifest.json"
+EXPORT_LINK_SECONDS = 24 * 3600
+"""How long a link to a stored export stays good: a day, long enough to
+hand it to someone, short enough that a pasted link is not a leak."""
 _PAGE_SUFFIXES = (".htm", ".html")
 
 
@@ -81,12 +89,49 @@ class _Folder:
 async def export_site(session: AsyncSession, site: str) -> bytes:
     """The site's latest successful fetch of every page, its stored
     assets, and the manifest, as one zip."""
+    data, _ = await _build(session, site, with_assets=True)
+    return data
+
+
+async def store_export(session: AsyncSession, site: str) -> StoredExport:
+    """The export kept where it outlives the stack: the object store,
+    under the zip's content key, with a link when the store gives one.
+
+    The pages and the manifest only. The assets are in that same store
+    already, under the keys the manifest names, so the zip stays a few
+    megabytes for a site whose media runs to half a gigabyte, and the
+    store never holds the same bytes twice.
+    """
+    data, manifest = await _build(session, site, with_assets=False)
+    storage = get_storage()
+    key = await storage.put(data, content_type="application/zip")
+    return StoredExport(
+        site=site,
+        key=key,
+        size=len(data),
+        pages=len(manifest["pages"]),
+        assets=len(manifest["assets"]),
+        url=await storage.presigned_url(key, expires_seconds=EXPORT_LINK_SECONDS),
+    )
+
+
+async def _build(
+    session: AsyncSession, site: str, *, with_assets: bool
+) -> tuple[bytes, dict[str, Any]]:
+    """The zip and its manifest; the assets' bytes in it, or only their
+    keys and the paths they would take."""
     storage = get_storage()
     buffer = io.BytesIO()
     manifest: dict[str, Any] = {"site": site, "pages": [], "assets": [], "missing": []}
     folder = _Folder(buffer)
     with folder.archive:
-        for page in await queries.site_pages(session, site):
+        # A page the live site and the archive both gave is two rows and
+        # one path; the live copy is written first, so it is the one kept.
+        pages = sorted(
+            await queries.site_pages(session, site),
+            key=lambda p: (p.source_kind == SOURCE_KIND, p.source_url),
+        )
+        for page in pages:
             html, markdown = _page_paths(page.source_url)
             if folder.write(html, page.html or "") and folder.write(
                 markdown, page.content or ""
@@ -96,6 +141,14 @@ async def export_site(session: AsyncSession, site: str) -> bytes:
                 )
                 manifest["pages"].append({**entry, "html": html, "markdown": markdown})
         for asset in await queries.site_assets(session, site):
+            path = file_path(asset.original_url, site)
+            entry = CrawledAssetRead.model_validate(asset).model_dump(mode="json")
+            if not with_assets:
+                # Listed once per path, as the folder would hold it.
+                if path not in folder.names:
+                    folder.names.add(path)
+                    manifest["assets"].append({**entry, "path": path})
+                continue
             data = await storage.get(str(asset.storage_key))
             if data is None:
                 logger.warning(
@@ -105,11 +158,9 @@ async def export_site(session: AsyncSession, site: str) -> bytes:
                 )
                 manifest["missing"].append(asset.original_url)
                 continue
-            path = file_path(asset.original_url, site)
             # Images and archives are already compressed; deflating them
             # costs CPU for nothing.
             if folder.write(path, data, compress=False):
-                entry = CrawledAssetRead.model_validate(asset).model_dump(mode="json")
                 manifest["assets"].append({**entry, "path": path})
         folder.write(MANIFEST, json.dumps(manifest, indent=2))
-    return buffer.getvalue()
+    return buffer.getvalue(), manifest

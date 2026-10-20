@@ -1,4 +1,5 @@
-"""Turning what someone typed into something fetchable.
+"""URL helpers: what someone typed made fetchable, one spelling per
+page, and which site a URL belongs to.
 
 ``example.com`` is what people write, in the dashboard and on the CLI.
 ``HttpUrl`` refuses it: no scheme, so it parses as a relative reference.
@@ -49,3 +50,43 @@ def canonical_url(url: str) -> str:
     return urlunsplit(
         (parts.scheme.lower(), host, parts.path or "/", parts.query, parts.fragment)
     )
+
+
+def site_of(url: str) -> str | None:
+    """The host a URL belongs to, ignoring a leading ``www.``.
+
+    Stored on every row and grouped on for the sites view, so the
+    domain guard and the drill-down cannot disagree about what counts
+    as one site.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host.removeprefix("www.")
+
+
+def page_key(url: str) -> str:
+    """One name per page across the ways it was reached: the live site
+    says ``https://a.test/x``, the archive's original ``http://www.a.test/x``,
+    and both are ``a.test/x``. Scheme and ``www.`` are the road; the site,
+    path and query are the page."""
+    parts = urlsplit(url)
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{site_of(url) or ''}{parts.path or '/'}{query}"
+
+
+def same_site(seed: str, found: str) -> bool:
+    """Whether ``found`` belongs to the same site as ``seed``.
+
+    Subdomains count as the same site; a bare host change does not.
+    crawl4ai is told not to leave the domain, but the promise shown in
+    the UI is ours, so results are checked here rather than trusted.
+    """
+    seed_site = site_of(seed)
+    found_site = site_of(found)
+    if seed_site is None or found_site is None:
+        return False
+    return found_site == seed_site or found_site.endswith(f".{seed_site}")

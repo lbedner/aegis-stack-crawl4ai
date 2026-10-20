@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from app.components.worker import registry
-from app.services.crawler import dispatch
+from app.services.crawler import jobs
 
 
 def test_the_crawler_queue_is_discovered_with_its_task() -> None:
@@ -39,10 +39,10 @@ async def test_a_job_is_recorded_then_handed_to_the_worker(
     async def fake_enqueue(task: str, queue: str, *args: Any) -> None:
         enqueued.append((task, queue, *args))
 
-    monkeypatch.setattr(dispatch, "_store", lambda: _Store())
-    monkeypatch.setattr(dispatch, "_enqueue", fake_enqueue)
+    monkeypatch.setattr(jobs, "_store", lambda: _Store())
+    monkeypatch.setattr(jobs, "_enqueue", fake_enqueue)
 
-    job_id = await dispatch.start_crawl(["https://a.test"])
+    job_id = await jobs.start_crawl(["https://a.test"])
 
     assert created == [(job_id, "crawler-batch:1")]
     task, queue, got_id, kind, payload = enqueued[0]
