@@ -23,11 +23,13 @@ from app.core.db import AsyncSessionLocal
 from app.services.crawler import queries
 from app.services.crawler.domains.archive import resolve
 from app.services.crawler.domains.assets import fetch_assets
+from app.services.crawler.domains.export import store_export
 from app.services.crawler.models import CrawledPage
-from app.services.crawler.schemas import CrawlOptions
 from app.services.crawler.schemas import (
     CrawledPageResult,
+    CrawlOptions,
     CrawlSummary,
+    StoredExport,
     WaybackRequest,
 )
 from app.services.crawler.service import CrawlerService
@@ -133,10 +135,21 @@ async def run_assets(site: str, *, report: SetLabel = unwatched) -> CrawlSummary
     return CrawlSummary(requested=len(pages), fetched=fetched, failed=failed)
 
 
+async def run_export(site: str, *, report: SetLabel = unwatched) -> StoredExport:
+    """Pack a site's pages and manifest into the object store. Work for
+    the worker, like a crawl: a site's pages are read and deflated here,
+    never inside a webserver request. The start label says what is
+    happening and the ``StoredExport`` says where it went."""
+    async with AsyncSessionLocal() as session:
+        return await store_export(session, site)
+
+
 async def run_job_kind(
     kind: str, payload: dict[str, Any], *, report: SetLabel = unwatched
-) -> CrawlSummary:
+) -> CrawlSummary | StoredExport:
     """The one map from a job's kind and JSON payload to the work."""
+    if kind == "export":
+        return await run_export(payload["site"], report=report)
     if kind == "crawl":
         return await run_crawl(
             payload["urls"],
@@ -266,5 +279,12 @@ async def start_assets(site: str) -> str:
     """Start the per-site asset backfill and return its job id."""
     return await _start(
         f"crawler-assets:{site}", f"Listing {site}'s pages...", "assets", {"site": site}
+    )
+
+
+async def start_export(site: str) -> str:
+    """Start packing the site into the object store; its job id."""
+    return await _start(
+        f"crawler-export:{site}", f"Packing {site}...", "export", {"site": site}
     )
 

@@ -22,10 +22,12 @@ import zipfile
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.concurrency import cpu_bound
 from app.core.log import logger
 from app.core.storage import get_storage
 from app.services.crawler import queries
 from app.services.crawler.domains.archive import SOURCE_KIND
+from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
     CrawledAssetRead,
     CrawledPageSummary,
@@ -68,8 +70,8 @@ def _page_paths(url: str) -> tuple[str, str]:
 
 
 class _Folder:
-    """The zip, refusing to write one path twice: a collision is logged
-    and skipped, never a silent overwrite."""
+    """The zip, refusing to write one path twice: a second writer of a
+    path is skipped, never a silent overwrite."""
 
     def __init__(self, buffer: io.BytesIO) -> None:
         self.archive = zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED)
@@ -77,7 +79,6 @@ class _Folder:
 
     def write(self, path: str, data: bytes | str, *, compress: bool = True) -> bool:
         if path in self.names:
-            logger.warning("crawler.export collision path=%s", path)
             return False
         self.names.add(path)
         self.archive.writestr(
@@ -119,19 +120,42 @@ async def _build(
     session: AsyncSession, site: str, *, with_assets: bool
 ) -> tuple[bytes, dict[str, Any]]:
     """The zip and its manifest; the assets' bytes in it, or only their
-    keys and the paths they would take."""
-    storage = get_storage()
+    keys and the paths they would take. The reads are awaited here; the
+    deflating is CPU work, done off the loop (``cpu_bound``)."""
+    pages = await queries.site_pages(session, site)
+    assets = await queries.site_assets(session, site)
+    blobs: dict[str, bytes | None] = {}
+    if with_assets:
+        storage = get_storage()
+        for asset in assets:
+            key = str(asset.storage_key)
+            blobs[key] = await storage.get(key)
+    return await cpu_bound(_pack, site, pages, assets, blobs, with_assets)
+
+
+def _pack(
+    site: str,
+    pages: list[CrawledPage],
+    assets: list[CrawledAsset],
+    blobs: dict[str, bytes | None],
+    with_assets: bool,
+) -> tuple[bytes, dict[str, Any]]:
     buffer = io.BytesIO()
-    manifest: dict[str, Any] = {"site": site, "pages": [], "assets": [], "missing": []}
+    manifest: dict[str, Any] = {
+        "site": site,
+        "pages": [],
+        "assets": [],
+        "missing": [],
+        "superseded": [],
+    }
     folder = _Folder(buffer)
     with folder.archive:
         # A page the live site and the archive both gave is two rows and
-        # one path; the live copy is written first, so it is the one kept.
-        pages = sorted(
-            await queries.site_pages(session, site),
-            key=lambda p: (p.source_kind == SOURCE_KIND, p.source_url),
-        )
-        for page in pages:
+        # one path; the live copy is written first, so it is the one kept,
+        # and the other is named as superseded: expected, not a fault.
+        for page in sorted(
+            pages, key=lambda p: (p.source_kind == SOURCE_KIND, p.source_url)
+        ):
             html, markdown = _page_paths(page.source_url)
             if folder.write(html, page.html or "") and folder.write(
                 markdown, page.content or ""
@@ -140,7 +164,15 @@ async def _build(
                     mode="json", exclude={"content"}
                 )
                 manifest["pages"].append({**entry, "html": html, "markdown": markdown})
-        for asset in await queries.site_assets(session, site):
+            else:
+                manifest["superseded"].append(page.source_url)
+        if manifest["superseded"]:
+            logger.info(
+                "crawler.export superseded site=%s count=%d",
+                site,
+                len(manifest["superseded"]),
+            )
+        for asset in assets:
             path = file_path(asset.original_url, site)
             entry = CrawledAssetRead.model_validate(asset).model_dump(mode="json")
             if not with_assets:
@@ -149,7 +181,7 @@ async def _build(
                     folder.names.add(path)
                     manifest["assets"].append({**entry, "path": path})
                 continue
-            data = await storage.get(str(asset.storage_key))
+            data = blobs.get(str(asset.storage_key))
             if data is None:
                 logger.warning(
                     "crawler.export missing url=%s key=%s",

@@ -44,8 +44,9 @@ on the Flet dashboard, and a Crawler page on the htmx Overseer (Overview, Sites,
 Crawl), at the rail entry the generic status page would otherwise take.
 
 - *Overview* is the counts.
-- *Sites* are the sites you have crawled. A site narrows its pages to the failed, exports
-  as a zip of plain files, and fetches the assets its pages name.
+- *Sites* are the sites you have crawled. A site narrows its pages to the failed, packs
+  its export into the object store, and fetches the assets its pages name; both are jobs
+  the Crawl section follows.
 - *Pages* open on their markdown, their raw HTML and their assets.
 - *Crawl* starts a crawl of live sites (seeds, depth, max pages, a CSS selector) or of
   one site from the Wayback Machine (domain, from/to, include/exclude globs), either with
@@ -60,7 +61,8 @@ Crawl), at the rail entry the generic status page would otherwise take.
 | `POST /wayback` | fetch every archived page of a site, same `202` + `job_id` |
 | `GET /sites` | crawled sites, with page and failure counts |
 | `POST /sites/{site}/assets` | fetch the site's missing assets, same `202` + `job_id` |
-| `GET /sites/{site}/export` | the site as a zip: pages, assets, `manifest.json` |
+| `GET /sites/{site}/export` | the site as a zip: pages, assets, `manifest.json` (built in the request; small sites) |
+| `POST /sites/{site}/export` | pages and `manifest.json` kept in the object store, same `202` + `job_id`; the job's result is the `StoredExport` |
 | `GET /pages` | recent pages, newest first; `?site=` narrows, `?failed_only=` filters |
 | `GET /pages/{id}` | one stored page, markdown and the HTML it came from |
 | `GET /pages/{id}/assets` | the files that page references, and where their bytes are |
@@ -118,9 +120,14 @@ stored, assets whose fetch was throttled.
 The site as a folder: each page's HTML and markdown at its URL path (`journal/may_2005.htm`
 and `journal/may_2005.md`, `index.html` for a directory), each asset at its own path, and
 a `manifest.json` naming every page and asset with its URL, snapshot timestamp, hash and
-content type, plus a `missing` list for any object the store no longer holds. The latest
-successful fetch of each page is the one exported. Re-running overwrites, so the folder
-is the archive and the stack is disposable.
+content type, plus a `missing` list for any object the store no longer holds and a
+`superseded` list for pages the live site and the archive both gave (the live copy is the
+one exported). The latest successful fetch of each page is the one exported. Re-running
+overwrites, so the folder is the archive and the stack is disposable.
+
+Without a directory, `crawl export example.com` packs the pages and the manifest into the
+object store as a job on the crawler queue (the assets are already there, under the keys
+the manifest names) and prints the key. The Overseer's Export button is the same job.
 
 ## Crawl options
 

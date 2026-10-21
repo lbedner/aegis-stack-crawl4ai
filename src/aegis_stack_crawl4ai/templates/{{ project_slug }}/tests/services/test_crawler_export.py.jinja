@@ -235,3 +235,6 @@ async def test_the_live_copy_of_a_page_beats_the_archived_one(
     assert archive.read("x.htm") == b"<p>live</p>"
     manifest = json.loads(archive.read("manifest.json"))
     assert [p["source_url"] for p in manifest["pages"]] == ["https://a.test/x.htm"]
+    # The archive copy is expected, not a fault: named in the manifest,
+    # one line in the log, never a warning per page.
+    assert manifest["superseded"] == ["http://www.a.test/x.htm"]

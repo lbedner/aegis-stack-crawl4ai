@@ -11,7 +11,7 @@ Endpoints:
 - ``GET /sites`` — the crawled sites, with counts.
 - ``POST /sites/{site}/assets`` — fetch the site's missing assets, as a job.
 - ``GET /sites/{site}/export`` — a site as a zip of plain files.
-- ``POST /sites/{site}/export`` — that zip kept in the object store.
+- ``POST /sites/{site}/export`` — pages and manifest kept in the object store, as a job.
 - ``GET /pages`` — list recent pages, optionally for one site.
 - ``GET /pages/{page_id}`` — fetch a single stored page.
 - ``GET /pages/{page_id}/assets`` — the files that page references.
@@ -26,8 +26,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.db import get_async_db
 from app.services.crawler import queries
 from app.services.crawler.deps import get_crawler_service
-from app.services.crawler.domains.export import export_site, store_export
-from app.services.crawler.jobs import start_assets, start_crawl, start_wayback
+from app.services.crawler.domains.export import export_site
+from app.services.crawler.jobs import (
+    start_assets,
+    start_crawl,
+    start_export,
+    start_wayback,
+)
 from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
     BatchCrawlRequest,
@@ -37,7 +42,6 @@ from app.services.crawler.schemas import (
     CrawlerSite,
     CrawlerStats,
     CrawlRequest,
-    StoredExport,
     WaybackRequest,
 )
 from app.services.crawler.service import CrawlerService
@@ -123,14 +127,13 @@ async def export(
     )
 
 
-@router.post("/sites/{site}/export", response_model=StoredExport)
-async def keep_export(
-    site: str,
-    session: AsyncSession = Depends(get_async_db),
-) -> StoredExport:
-    """The site's export written to the object store; its key and a
-    link when the store gives one."""
-    return await store_export(session, site)
+@router.post("/sites/{site}/export", status_code=status.HTTP_202_ACCEPTED)
+async def keep_export(site: str) -> JSONResponse:
+    """Pack the site's pages and manifest into the object store, as a job:
+    its result is the ``StoredExport`` (the key, and a link when the
+    store gives one)."""
+    job_id = await start_export(site)
+    return JSONResponse({"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED)
 
 
 @router.get("/pages", response_model=list[CrawledPageSummary])

@@ -19,7 +19,12 @@ from app.components.web_frontend.overseer_access import overseer_gate
 from app.components.web_frontend.overseer_live import event_stream
 from app.components.web_frontend.rendering import dialog, go_to, toast_response
 from app.core.db import get_async_db
-from app.services.crawler.jobs import start_assets, start_crawl, start_wayback
+from app.services.crawler.jobs import (
+    start_assets,
+    start_crawl,
+    start_export,
+    start_wayback,
+)
 from app.services.crawler.schemas import (
     BatchCrawlRequest,
     CrawlOptions,
@@ -64,6 +69,16 @@ async def site_assets(site: Text) -> Response:
         overseer_crawler.job_url(job_id),
         f"Fetching {site}'s assets",
         target="#overseer-main",
+    )
+
+
+@router.post("/sites/export")
+async def site_export(site: Text) -> Response:
+    """Pack the site's pages and manifest into the object store; the Crawl
+    section follows the job and shows where it went."""
+    job_id = await start_export(site)
+    return go_to(
+        overseer_crawler.job_url(job_id), f"Packing {site}", target="#overseer-main"
     )
 
 
