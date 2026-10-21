@@ -89,12 +89,14 @@ def test_sections(crawler: TestClient) -> None:
     ]
 
 
+@pytest.mark.queryspy(allow_n_plus_one=True)  # two page loads, one store
 def test_overview_counts_the_store(crawler: TestClient, stored: Any) -> None:
     figures = text(one(_get(crawler), "#crawler-figures"))
     assert "Pages" in figures and "2" in figures
     assert "rose.test" in text(one(_get(crawler), "#crawler-sites"))
 
 
+@pytest.mark.queryspy(allow_n_plus_one=True)  # the list, then the drawer
 def test_a_site_opens_with_its_export(crawler: TestClient, stored: Any) -> None:
     rows = select(_get(crawler, "sites"), "#crawler-sites-list tbody tr")
     assert [text(select(r, "td")[0]) for r in rows] == ["rose.test"]
