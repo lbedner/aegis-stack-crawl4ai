@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy import ColumnElement, and_, case, func, not_, or_
 from sqlalchemy.orm import defer
-from sqlmodel import select
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.services.crawler.models import CrawledAsset, CrawledPage
@@ -188,15 +188,19 @@ def _newest(model: Any, key: Any, *where: ColumnElement[bool]) -> Any:
     return select(func.max(model.id)).where(*where).group_by(key)
 
 
-async def site_pages(db: AsyncSession, site: str) -> list[CrawledPage]:
-    """Every page of a site, its latest successful fetch only, by URL.
+async def site_pages(
+    db: AsyncSession, site: str, *, path_like: str | None = None
+) -> list[CrawledPage]:
+    """Every page of a site, its latest successful fetch only, by URL;
+    ``path_like`` (a SQL pattern on the URL) narrows to a part of it.
 
     Only the newest row per URL leaves the database; the stale bodies
     of earlier fetches are never loaded.
     """
-    newest = _newest(
-        CrawledPage, CrawledPage.source_url, CrawledPage.site == site, not_(_FAILED)
-    )
+    within = [CrawledPage.site == site, not_(_FAILED)]
+    if path_like is not None:
+        within.append(col(CrawledPage.source_url).like(path_like))
+    newest = _newest(CrawledPage, CrawledPage.source_url, *within)
     rows = await db.exec(
         select(CrawledPage)
         .where(CrawledPage.id.in_(newest))

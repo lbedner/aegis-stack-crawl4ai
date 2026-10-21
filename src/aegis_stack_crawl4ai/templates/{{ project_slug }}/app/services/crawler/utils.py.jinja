@@ -8,6 +8,7 @@ about a case it can obviously resolve, so it resolves it here, once, on
 the way into every request model.
 """
 
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 _SCHEMES = ("http://", "https://")
@@ -90,3 +91,12 @@ def same_site(seed: str, found: str) -> bool:
     if seed_site is None or found_site is None:
         return False
     return found_site == seed_site or found_site.endswith(f".{seed_site}")
+
+
+def live_first(pages: list[Any]) -> list[Any]:
+    """Pages with the live site's fetch of a page before the archive's,
+    then by URL: the order that keeps the live copy wherever one path
+    can hold only one page (the export's folder)."""
+    from app.services.crawler.domains.archive import SOURCE_KIND
+
+    return sorted(pages, key=lambda p: (p.source_kind == SOURCE_KIND, p.source_url))

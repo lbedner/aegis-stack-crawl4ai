@@ -26,14 +26,13 @@ from app.core.concurrency import cpu_bound
 from app.core.log import logger
 from app.core.storage import get_storage
 from app.services.crawler import queries
-from app.services.crawler.domains.archive import SOURCE_KIND
 from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
     CrawledAssetRead,
-    CrawledPageSummary,
     StoredExport,
+    summary_of,
 )
-from app.services.crawler.utils import site_of
+from app.services.crawler.utils import live_first, site_of
 
 MANIFEST = "manifest.json"
 EXPORT_LINK_SECONDS = 24 * 3600
@@ -153,17 +152,14 @@ def _pack(
         # A page the live site and the archive both gave is two rows and
         # one path; the live copy is written first, so it is the one kept,
         # and the other is named as superseded: expected, not a fault.
-        for page in sorted(
-            pages, key=lambda p: (p.source_kind == SOURCE_KIND, p.source_url)
-        ):
+        for page in live_first(pages):
             html, markdown = _page_paths(page.source_url)
             if folder.write(html, page.html or "") and folder.write(
                 markdown, page.content or ""
             ):
-                entry = CrawledPageSummary.model_validate(page).model_dump(
-                    mode="json", exclude={"content"}
+                manifest["pages"].append(
+                    {**summary_of(page), "html": html, "markdown": markdown}
                 )
-                manifest["pages"].append({**entry, "html": html, "markdown": markdown})
             else:
                 manifest["superseded"].append(page.source_url)
         if manifest["superseded"]:

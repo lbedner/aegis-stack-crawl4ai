@@ -52,7 +52,7 @@ Crawl), at the rail entry the generic status page would otherwise take.
   one site from the Wayback Machine (domain, from/to, include/exclude globs), either with
   assets, and follows the job while it runs.
 
-**API.** Six routes under `/api/v1/crawler`:
+**API.** Under `/api/v1/crawler`:
 
 | route | does |
 |---|---|
@@ -69,6 +69,8 @@ Crawl), at the rail entry the generic status page would otherwise take.
 | `GET /stats` | counts, distinct URLs, content-type split, last fetch |
 
 **CLI.** `<project> crawl stats | fetch | site | wayback | assets | export | list | show | retry-failed`.
+
+**Tools.** For an agent, through the app's tool registry (MCP and chat): `crawler_sites`, `crawler_pages` and `crawler_page`, the store as an agent reads it.
 
 **Progress.** A crawl runs as a framework job, so progress streams over
 `/api/v1/jobs/{job_id}/events` and the dashboard follows it without knowing anything about
@@ -336,6 +338,7 @@ aegis-stack-crawl4ai/
 │       │   ├── deps.py                   # FastAPI DI, one crawler per process
 │       │   ├── settings.py               # settings mixin (leaf module)
 │       │   ├── health.py                 # dashboard health check
+│       │   ├── tools.py                  # the store, for an agent
 │       │   └── domains/                  # the subsystems
 │       │       ├── archive.py            # Wayback snapshots, paced and retried
 │       │       ├── wayback.py            # a site listed from the CDX index
