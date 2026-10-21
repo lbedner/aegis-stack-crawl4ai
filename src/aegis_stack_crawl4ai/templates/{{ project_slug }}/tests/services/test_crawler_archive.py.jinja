@@ -181,6 +181,7 @@ async def test_a_refused_page_keeps_nothing(async_db_session: Any) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.queryspy(allow_n_plus_one=True)  # stores twice: the second is the test
 async def test_a_deduped_page_is_still_readable(async_db_session: Any) -> None:
     """The row handed back on a hash match is read next by the assets
     step, outside any transaction: its columns must be loaded, not
