@@ -23,6 +23,7 @@ from aegis.core.migration_spec import MigrationSpec
 from aegis.core.plugins.spec import (
     FrontendWidgetWiring,
     HealthCheckWiring,
+    OverseerPageWiring,
     PluginKind,
     PluginSpec,
     PluginWiring,
@@ -40,6 +41,19 @@ from aegis.core.plugins.spec import (
 # mismatch is a dead click rather than an error.
 HEALTH_LABEL = "crawler"
 
+# The Overseer page's files, written only on stacks with the htmx
+# frontend: elsewhere they would import a frontend that is not there.
+OVERSEER_FILES = [
+    "app/components/web_frontend/overseer_crawler.py",
+    "app/components/web_frontend/routes/partials/overseer_crawler.py",
+    "app/components/web_frontend/templates/pages/overseer/crawler",
+    "tests/web/test_overseer_crawler.py",
+]
+
+
+def _htmx(opts: dict) -> bool:
+    return bool(opts.get("include_htmx"))
+
 
 def get_spec() -> PluginSpec:
     """Return the plugin spec."""
@@ -49,10 +63,10 @@ def get_spec() -> PluginSpec:
         description="Web crawling and scraping via Crawl4AI",
         version="0.1.0",
         verified=False,
-        # PEP 440 specifier. 0.16 is the framework that runs a plugin's
-        # queue as its own ``worker-<queue>`` container; on anything older
-        # a crawl in a worker stack sits queued with no process to take it.
-        aegis_version=">=0.16.0",
+        # PEP 440 specifier. 0.16.0 is the framework that runs a plugin's
+        # queue as its own ``worker-<queue>`` container; 0.16.1 is the one
+        # that reads ``overseer_pages`` and gates a plugin's ``extras``.
+        aegis_version=">=0.16.1",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.
@@ -113,7 +127,8 @@ def get_spec() -> PluginSpec:
                 "tests/services/test_crawler_wiring.py",
                 "tests/services/test_crawler_worker.py",
                 "tests/components/frontend/test_crawler_tab.py",
-            ]
+            ],
+            extras={"include_htmx": OVERSEER_FILES},
         ),
         wiring=PluginWiring(
             routers=[
@@ -122,6 +137,15 @@ def get_spec() -> PluginSpec:
                     symbol="router",
                     prefix="/api/v1/crawler",
                     tags=["crawler"],
+                ),
+                # The Overseer page's actions. Its own prefix, and the
+                # Overseer gate on the router, since it is not mounted
+                # under the pages router that applies it.
+                RouterWiring(
+                    module="app.components.web_frontend.routes.partials.overseer_crawler",
+                    alias="crawler_overseer_router",
+                    tags=["overseer"],
+                    when=_htmx,
                 ),
             ],
             settings_mixins=[
@@ -154,6 +178,16 @@ def get_spec() -> PluginSpec:
                     # The key the dashboard's click handler emits, and the
                     # one ``dashboard.crawler_ui.MODAL_KEY`` gives the card.
                     modal_id=f"service_{HEALTH_LABEL}",
+                ),
+            ],
+            # The htmx Overseer's page, in place of the generic status
+            # page at this entry: the Flet card and modal's counterpart.
+            overseer_pages=[
+                OverseerPageWiring(
+                    name=HEALTH_LABEL,
+                    module="app.components.web_frontend.overseer_crawler",
+                    folder="crawler",
+                    when=_htmx,
                 ),
             ],
         ),

@@ -21,10 +21,12 @@ from app.services.crawler.utils import page_key
 _FAILED = or_(
     CrawledPage.status_code.is_(None),
     CrawledPage.status_code >= 400,
+    and_(CrawledPage.content.is_(None), CrawledPage.html.is_(None)),
 )
-"""A fetch that produced nothing usable. Shared so the stats, the
-per-site counts and the retry queue cannot drift apart on what
-"failed" means."""
+"""A fetch that produced nothing usable: refused, or answered with nothing
+kept (a page crawl4ai's block heuristic failed, before its bytes were
+kept), so a re-run asks again. Shared so the stats, the per-site counts
+and the retry queue cannot drift apart on what "failed" means."""
 
 _IN_CHUNK = 900
 

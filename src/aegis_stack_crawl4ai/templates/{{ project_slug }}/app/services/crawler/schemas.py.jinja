@@ -179,6 +179,14 @@ class WaybackRequest(BaseModel):
     to_ts: CaptureTs = None
     options: CrawlOptions = Field(default_factory=CrawlOptions)
 
+    @field_validator("from_ts", "to_ts", mode="before")
+    @classmethod
+    def _accept_calendar_dates(cls, value: Any) -> Any:
+        """A calendar's ISO date (``2017-05-01``) is the archive's
+        ``20170501``: the Overseer and the dashboard pick dates, the CLI
+        types prefixes, and both land as one."""
+        return value.replace("-", "") if isinstance(value, str) else value
+
 
 class CrawlRequest(BaseModel):
     """Inbound request: fetch one URL and store the result."""

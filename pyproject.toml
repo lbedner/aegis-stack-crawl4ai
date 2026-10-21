@@ -8,12 +8,12 @@ version = "0.1.0"
 description = "Web crawling and scraping for Aegis Stack projects, via Crawl4AI"
 readme = "README.md"
 authors = [{ name = "Aegis Stack" }]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = ["aegis-stack", "aegis-stack-plugin", "crawl4ai", "web-crawling"]
 dependencies = [
-    "aegis-stack>=0.16.0",
+    "aegis-stack>=0.16.1",
 ]
 
 [project.urls]
@@ -37,6 +37,13 @@ packages = ["src/aegis_stack_crawl4ai"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+# The vendored templates are the generated project's code, checked by its
+# own ruff (``make check``), whose imports put ``app`` first-party.
+extend-exclude = ["src/aegis_stack_crawl4ai/templates"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+# The templates' own tests run in the generated project, not here.
+testpaths = ["tests"]

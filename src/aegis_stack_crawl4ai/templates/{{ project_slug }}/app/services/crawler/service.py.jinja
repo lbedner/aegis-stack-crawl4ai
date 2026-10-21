@@ -303,6 +303,7 @@ class CrawlerService:
         html: str | None = None
         content_type = "html"
         status_code: int | None = None
+        flagged: dict[str, str] = {}
 
         if getattr(result, "success", False):
             # The markdown is what the dashboard reads; the HTML is what
@@ -320,6 +321,14 @@ class CrawlerService:
                 # refused connection. 599 is the catch-all, not the norm.
                 or 599
             )
+            if status_code < 400:
+                # The host served the page and crawl4ai's block heuristic
+                # failed it anyway: an archived 2002 frame with no <body>,
+                # a bare script. Those bytes are the page, so they are
+                # kept, with the verdict beside them.
+                html = getattr(result, "html", None) or None
+                content = html
+                flagged = {"flagged": getattr(result, "error_message", None) or ""}
             logger.warning(
                 "crawler.fetch failed url=%s status=%s error=%s",
                 url,
@@ -364,6 +373,7 @@ class CrawlerService:
                 **_page_metadata(result),
                 **target.doc_metadata,
                 **(doc_metadata or {}),
+                **flagged,
             },
             status_code=status_code,
             source_kind=source_kind,

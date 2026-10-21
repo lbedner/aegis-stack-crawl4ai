@@ -91,11 +91,11 @@ class TestIdentity:
         """The floor is the framework that runs a plugin's queue as its
         own worker container; the spec and the package agree on it."""
         spec = get_spec()
-        assert spec.aegis_version == ">=0.16.0"
+        assert spec.aegis_version == ">=0.16.1"
         pyproject = tomllib.loads(
             (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
         )
-        assert "aegis-stack>=0.16.0" in pyproject["project"]["dependencies"]
+        assert "aegis-stack>=0.16.1" in pyproject["project"]["dependencies"]
 
 
 class TestSchemaIsolation:
@@ -221,6 +221,26 @@ class TestWiring:
         )
 
 
+class TestOverseerPage:
+    def test_registered_at_the_health_entry(self) -> None:
+        """At the rail entry the health check names, in place of the
+        generic status page there."""
+        spec = get_spec()
+        (page,) = spec.wiring.overseer_pages
+        assert page.name == spec.wiring.health_checks[0].label
+        assert page.module == "app.components.web_frontend.overseer_crawler"
+        assert page.folder == "crawler"
+
+    def test_page_and_actions_only_with_htmx(self) -> None:
+        spec = get_spec()
+        (page,) = spec.wiring.overseer_pages
+        actions = next(r for r in spec.wiring.routers if r.tags == ["overseer"])
+        for gate in (page.when, actions.when):
+            assert gate is not None
+            assert gate({"include_htmx": True})
+            assert not gate({"include_htmx": False})
+
+
 class TestFileManifest:
     def test_owns_crawler_service_dir(self) -> None:
         """``aegis remove crawl4ai`` walks ``files.primary`` to clean up.
@@ -240,14 +260,28 @@ class TestFileManifest:
             / "templates"
             / "{{ project_slug }}"
         )
-        owned = get_spec().files.primary
-        unowned = [
-            str(rel.with_suffix("") if rel.suffix == ".jinja" else rel)
+        files = get_spec().files
+        owned = [*files.primary, *(p for group in files.extras.values() for p in group)]
+        written = (
+            str(rel).removesuffix(".jinja")
             for rel in (p.relative_to(slug) for p in slug.rglob("*") if p.is_file())
+        )
+        unowned = [
+            out
+            for out in written
             if not any(
-                str(rel).startswith(entry.rstrip("/") + "/")
-                or str(rel.with_suffix("")) == entry
+                out == entry or out.startswith(entry.rstrip("/") + "/")
                 for entry in owned
             )
         ]
-        assert not unowned, f"rendered but not in files.primary: {unowned}"
+        assert not unowned, f"rendered but not in the manifest: {unowned}"
+
+    def test_overseer_page_lands_only_with_htmx(self) -> None:
+        """Without the htmx frontend the page would import one that is not
+        there, and its folder is the htmx component's own marker."""
+        htmx = get_spec().files.extras["include_htmx"]
+        assert "app/components/web_frontend/overseer_crawler.py" in htmx
+        assert not any(
+            "web_frontend" in p or p.startswith("tests/web")
+            for p in get_spec().files.primary
+        )

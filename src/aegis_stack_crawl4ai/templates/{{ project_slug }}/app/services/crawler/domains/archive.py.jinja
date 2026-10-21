@@ -9,7 +9,8 @@ is a way to reach a site, not a site of its own.
 archive.org throttles near fifteen requests a minute. Its turns are kept
 here, process-wide, so every job and every request in the process waits
 for the same clock, and a 429 or 503 pushes that clock out for all of
-them rather than being stored as a failed page.
+them rather than being stored as a failed page. A dropped connection is
+the same request for a pause: archive.org hangs up when it is busy.
 """
 
 from __future__ import annotations
@@ -115,18 +116,25 @@ async def turn(host: str) -> AsyncIterator[None]:
 async def patiently(
     host: str, call: Callable[[], Awaitable[T]], throttled: Callable[[T], bool]
 ) -> T:
-    """``call`` in the host's turn, retried when the host asks for a pause.
+    """``call`` in the host's turn, retried when the host asks for a pause:
+    a throttled answer, or the connection dropped without one.
 
     On a paced host the pause moves the shared clock, so every waiter
     honours it; elsewhere this task alone sleeps. The last answer is
-    returned as it came, so a host that stays busy is a stored failure.
+    returned as it came, so a host that stays busy is a stored failure;
+    a connection still dropping on the last try raises.
     """
     last = settings.CRAWLER_RETRY_LIMIT
     for attempt in range(last + 1):
         async with turn(host):
-            outcome = await call()
-            if not throttled(outcome) or attempt == last:
-                return outcome
+            try:
+                outcome = await call()
+            except httpx.TransportError:
+                if attempt == last:
+                    raise
+            else:
+                if not throttled(outcome) or attempt == last:
+                    return outcome
             wait = backoff(attempt)
             logger.info("crawler.throttled host=%s wait=%.0fs", host, wait)
             if _delay(host):
@@ -135,7 +143,7 @@ async def patiently(
                 )
         if not _delay(host):
             await asyncio.sleep(wait)
-    return outcome
+    raise AssertionError("unreachable: the last attempt returns or raises")
 
 
 @asynccontextmanager

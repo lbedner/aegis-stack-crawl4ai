@@ -18,12 +18,20 @@ from app.components.frontend.controls import (
     DataTableColumn,
     H3Text,
     SecondaryText,
+    ThemedSwitch,
 )
-from app.components.frontend.controls.buttons import BaseIconButton, IconCopyButton
+from app.components.frontend.controls.buttons import (
+    BaseIconButton,
+    IconCopyButton,
+    PulseButton,
+)
+from app.components.frontend.controls.jobs import follow_job
+from app.components.frontend.controls.tabs import PulseTabs
 from app.components.frontend.dashboard.crawler_ui import (
     PAGES_ENDPOINT,
     SITES_ENDPOINT,
     failed_cell,
+    site_endpoint,
     status_cell,
 )
 from app.components.frontend.state.session_state import get_session_state
@@ -32,7 +40,10 @@ from app.core.formatting import format_bytes, format_relative_time
 
 
 class PagesTab(ft.Container):
-    """Sites, then that site's pages, then one page's body.
+    """Sites, then that site's pages, then one page: its markdown, its
+    HTML and its assets. A site exports as a zip of plain files and
+    fetches the assets its pages name; its pages narrow to the failed.
+    The htmx Overseer's Sites and Pages sections offer the same.
 
     A crawl that follows links lands as hundreds of rows for a handful
     of sites, so the list nobody can read is not the one shown first.
@@ -54,6 +65,13 @@ class PagesTab(ft.Container):
         DataTableColumn("Last fetch", width=140, alignment="right"),
     ]
 
+    _ASSET_COLUMNS = [
+        DataTableColumn("URL", style="primary"),
+        DataTableColumn("Type", width=120),
+        DataTableColumn("Size", width=90, alignment="right"),
+        DataTableColumn("Status", width=80, alignment="right"),
+    ]
+
     _PAGE_COLUMNS = [
         DataTableColumn("URL", style="primary"),
         DataTableColumn("Type", width=100),
@@ -70,6 +88,13 @@ class PagesTab(ft.Container):
         self._open: dict[str, Any] | None = None
         self._sites: list[dict[str, Any]] = []
         self._pages: list[dict[str, Any]] = []
+        # The open page's HTML and assets, loaded when it opens: the page
+        # list carries neither.
+        self._html: str | None = None
+        self._assets: list[dict[str, Any]] | None = None
+        self._failed_only = ThemedSwitch(value=False, on_change=self._filter_changed)
+        self._note = SecondaryText("")
+        self._fetching = False
         # Same shape as the load-tests tab, the in-tree long-table tab:
         # an expanding body Container whose content is swapped per level,
         # and each level's own column owns the scrolling. Guessing a
@@ -94,8 +119,9 @@ class PagesTab(ft.Container):
             rows = await api.get(SITES_ENDPOINT)
             self._sites = [row for row in rows or [] if isinstance(row, dict)]
         else:
+            failed = "&failed_only=true" if self._failed_only.value else ""
             rows = await api.get(
-                f"{PAGES_ENDPOINT}?limit={self._LIMIT}&site={self._site}"
+                f"{PAGES_ENDPOINT}?limit={self._LIMIT}&site={self._site}{failed}"
             )
             self._pages = [row for row in rows or [] if isinstance(row, dict)]
         self._draw()
@@ -123,11 +149,57 @@ class PagesTab(ft.Container):
         self._page.run_task(self.refresh)
 
     def _open_page(self, index: int) -> None:
-        """Open the body of the page on that row."""
+        """Open the page on that row; its HTML and assets follow."""
         if not 0 <= index < len(self._pages):
             return
         self._open = self._pages[index]
+        self._html = self._assets = None
         self._draw()
+        self._page.run_task(self._load_page)
+
+    async def _load_page(self) -> None:
+        page_id = (self._open or {}).get("id")
+        if page_id is None:
+            return
+        api = get_session_state(self._page).api_client
+        stored = await api.get(f"{PAGES_ENDPOINT}/{page_id}")
+        assets = await api.get(f"{PAGES_ENDPOINT}/{page_id}/assets")
+        if (self._open or {}).get("id") != page_id:
+            return  # another page opened meanwhile
+        html = stored.get("html") if isinstance(stored, dict) else None
+        self._html = html if isinstance(html, str) else ""
+        self._assets = [a for a in assets or [] if isinstance(a, dict)]
+        self._draw()
+
+    def _filter_changed(self, _event: Any = None) -> None:
+        self._page.run_task(self.refresh)
+
+    def _say(self, message: str) -> None:
+        self._note.value = message
+        with suppress(Exception):
+            self._note.update()
+
+    async def _export(self) -> None:
+        """The site as a zip of plain files, through the export route."""
+        self._page.launch_url(site_endpoint(self._site or "", "export"))
+
+    async def _fetch_assets(self) -> None:
+        """Fetch the assets the site's pages name, and follow the job.
+        Reports into the note line: a raise here reaches nobody."""
+        if self._fetching or not self._site:
+            return
+        self._fetching = True
+        try:
+            api = get_session_state(self._page).api_client
+            started = await api.post(site_endpoint(self._site, "assets"))
+            job_id = started.get("job_id") if isinstance(started, dict) else None
+            if not job_id:
+                self._say("The asset fetch did not start.")
+                return
+            outcome = await follow_job(api, str(job_id), on_label=self._say)
+            self._say(outcome.error or "Assets fetched.")
+        finally:
+            self._fetching = False
 
     def _go_back(self) -> None:
         """One level up: body to pages, pages to sites."""
@@ -194,7 +266,20 @@ class PagesTab(ft.Container):
 
     def _pages_view(self) -> ft.Control:
         return self._level(
-            self._header(self._site or ""),
+            self._header(
+                self._site or "",
+                trailing=ft.Row(
+                    [
+                        self._failed_only,
+                        SecondaryText("Failed only"),
+                        PulseButton(self._export, "Export", compact=True),
+                        PulseButton(self._fetch_assets, "Assets", compact=True),
+                    ],
+                    spacing=Theme.Spacing.SM,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ),
+            self._note,
             DataTable(
                 columns=self._PAGE_COLUMNS,
                 rows=[
@@ -218,6 +303,43 @@ class PagesTab(ft.Container):
         body = (self._open or {}).get("content")
         return body if isinstance(body, str) else ""
 
+    @staticmethod
+    def _text_pane(text: str) -> ft.Control:
+        """A stored body, scrolling inside its tab."""
+        return ft.Column(
+            [
+                ft.Text(
+                    text,
+                    size=12,
+                    font_family="monospace",
+                    selectable=True,
+                    color=Theme.Colors.TEXT_SECONDARY,
+                )
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    def _assets_pane(self) -> ft.Control:
+        if self._assets is None:
+            return SecondaryText("Loading...")
+        return DataTable(
+            columns=self._ASSET_COLUMNS,
+            rows=[
+                [
+                    asset.get("original_url") or "",
+                    asset.get("content_type") or "",
+                    format_bytes(int(asset.get("size") or 0))
+                    if asset.get("storage_key")
+                    else "—",
+                    status_cell(asset.get("status_code")),
+                ]
+                for asset in self._assets
+            ],
+            empty_message="No assets on this page",
+            expand=True,
+        )
+
     def _content_view(self) -> ft.Control:
         page = self._open or {}
         body = self._body_text()
@@ -239,17 +361,26 @@ class PagesTab(ft.Container):
                 )
             ),
             ft.Divider(height=1, color=ft.Colors.OUTLINE_VARIANT),
-            ft.Column(
-                [
-                    ft.Text(
-                        body or "Nothing came back for this URL.",
-                        size=12,
-                        font_family="monospace",
-                        selectable=True,
-                        color=Theme.Colors.TEXT_SECONDARY,
-                    )
+            PulseTabs(
+                tabs=[
+                    ft.Tab(
+                        text="Markdown",
+                        content=self._text_pane(
+                            body or "Nothing came back for this URL."
+                        ),
+                    ),
+                    ft.Tab(
+                        text="HTML",
+                        content=self._text_pane(
+                            "Loading..."
+                            if self._html is None
+                            else self._html or "No HTML stored."
+                        ),
+                    ),
+                    ft.Tab(
+                        text=f"Assets ({len(self._assets or [])})",
+                        content=self._assets_pane(),
+                    ),
                 ],
-                scroll=ft.ScrollMode.AUTO,
-                expand=True,
             ),
         )

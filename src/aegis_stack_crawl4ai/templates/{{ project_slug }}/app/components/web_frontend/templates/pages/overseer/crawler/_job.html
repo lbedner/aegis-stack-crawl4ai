@@ -1,0 +1,27 @@
+{# A crawl job (overseer_crawler.job_context), streamed while the section
+   is open: its label while it runs, why it failed, or what it fetched. #}
+{% from "components/macros/layout.html" import card, stats_strip %}
+{% from "components/macros/table.html" import data_table %}
+{% call card("Job") %}
+{% if not job %}
+<p class="text-xs text-aegis-muted">That job is no longer kept.</p>
+{% elif job.status == "running" %}
+<p data-status="running" class="text-sm flex items-baseline gap-2"><span class="loading loading-dots loading-xs text-aegis-teal" aria-hidden="true"></span><span class="text-aegis-muted">{{ job.label or "Running" }}</span></p>
+{% elif job.status == "failed" %}
+<p data-status="failed" class="text-sm text-error">{{ job.error }}</p>
+{% else %}
+<div data-status="done" class="space-y-4">
+  {{ stats_strip([
+    {"label": "Requested", "value": job.summary.requested if job.summary else 0},
+    {"label": "Fetched", "value": job.summary.fetched if job.summary else 0},
+    {"label": "Failed", "value": job.summary.failed if job.summary else 0},
+  ]) }}
+  {{ data_table([
+    {"key": "url", "label": "URL", "kind": "code"},
+    {"key": "status", "label": "Status", "kind": "status"},
+    {"key": "type", "label": "Type"},
+    {"key": "size", "label": "Size", "align": "right"},
+  ], job.rows, empty="Nothing fetched") }}
+</div>
+{% endif %}
+{% endcall %}

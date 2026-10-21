@@ -1,0 +1,42 @@
+{# One form, two modes: live sites from their seeds, or a site from the
+   Wayback Machine. Either starts a job; the address then holds it and the
+   section follows it below the form while it runs. #}
+{% from "components/macros/layout.html" import card %}
+{% from "components/macros/form.html" import checkbox, date_input, field, number_input, primary_button, text_input, textarea %}
+<div class="space-y-4">
+{% call card("Crawl", id="crawler-crawl") %}
+<form hx-post="{{ partials }}/crawl" hx-swap="none" data-write x-data="{ mode: '{{ mode }}' }" class="space-y-4">
+  <div role="radiogroup" aria-label="Mode" class="flex gap-4 text-xs">
+    <label class="inline-flex items-center gap-2 cursor-pointer"><input type="radio" name="mode" value="site" x-model="mode" class="accent-aegis-teal">Live site</label>
+    <label class="inline-flex items-center gap-2 cursor-pointer"><input type="radio" name="mode" value="wayback" x-model="mode" class="accent-aegis-teal">Wayback Machine</label>
+  </div>
+  {# Bound ``hidden``, not ``x-show``: x-show only sets ``display``, and the
+     server's ``hidden`` (the right mode before Alpine loads) would stay. #}
+  <fieldset :hidden="mode !== 'site'" :disabled="mode !== 'site'" class="space-y-4"{% if mode == "wayback" %} hidden disabled{% endif %}>
+    {% call field("Seeds, one URL per line") %}{{ textarea("seeds", rows=3, placeholder="https://example.com") }}{% endcall %}
+    <div class="grid grid-cols-3 gap-3">
+      {% call field("Depth (0 to " ~ max_depth ~ ")") %}{{ number_input("depth", 0, min=0, max=max_depth) }}{% endcall %}
+      {% call field("Max pages per seed") %}{{ number_input("max_pages", 25, min=1, max=500) }}{% endcall %}
+      {% call field("CSS selector") %}{{ text_input("selector", placeholder="main article") }}{% endcall %}
+    </div>
+    {{ checkbox("stay_on_domain", True, "Stay on the site", "1") }}
+  </fieldset>
+  <fieldset :hidden="mode !== 'wayback'" :disabled="mode !== 'wayback'" class="space-y-4"{% if mode != "wayback" %} hidden disabled{% endif %}>
+    {% call field("Domain") %}{{ text_input("domain", placeholder="example.com") }}{% endcall %}
+    <div class="grid grid-cols-2 gap-3">
+      {% call field("Captured from") %}{{ date_input("from_ts", block=True) }}{% endcall %}
+      {% call field("Captured to") %}{{ date_input("to_ts", block=True) }}{% endcall %}
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      {% call field("Include, one glob per line") %}{{ textarea("include", rows=2) }}{% endcall %}
+      {% call field("Exclude, one glob per line") %}{{ textarea("exclude", rows=2) }}{% endcall %}
+    </div>
+  </fieldset>
+  {{ checkbox("assets", False, "Fetch each page's images, stylesheets and downloads", "1") }}
+  <div class="flex justify-end">{{ primary_button("Start", type="submit") }}</div>
+</form>
+{% endcall %}
+{% if events %}
+<div id="crawler-job" hx-ext="sse" sse-connect="{{ events }}"><div sse-swap="{{ event }}" hx-target="this">{% include "pages/overseer/crawler/_job.html" %}</div></div>
+{% endif %}
+</div>
