@@ -18,7 +18,7 @@ from app.components.web_frontend.routes.partials import (
 )
 from app.services.crawler import SERVICE_NAME
 from app.services.crawler.models import CrawledAsset, CrawledPage
-from app.services.crawler.schemas import CrawlSummary
+from app.services.crawler.schemas import CrawlSummary, StoredExport
 from app.services.system.jobs import get_job_runner
 from app.services.system.models import ComponentStatus
 from tests.web.dom import location, one, select, text
@@ -100,9 +100,43 @@ def test_a_site_opens_with_its_export(crawler: TestClient, stored: Any) -> None:
     assert [text(select(r, "td")[0]) for r in rows] == ["rose.test"]
     drawer = crawler.get(f"{PARTIALS}/sites/drawer", params={"site": "rose.test"})
     assert drawer.status_code == 200
-    export = one(drawer.text, "a[download]")
-    assert export.get("href") == "/api/v1/crawler/sites/rose.test/export"
+    export = one(drawer.text, f'button[hx-post="{PARTIALS}/sites/export"]')
+    assert "rose.test" in export.get("hx-vals")
+    # Its sibling, the asset fetch, is wired the same way (a real attribute,
+    # not an escaped one).
+    assets = one(drawer.text, f'button[hx-post="{PARTIALS}/sites/assets"]')
+    assert "rose.test" in assets.get("hx-vals")
     assert "Failed" in [text(a) for a in select(drawer.text, "a")]
+
+
+def test_an_export_starts_and_the_section_follows_it(
+    crawler: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[str] = []
+
+    async def start_export(site: str) -> str:
+        asked.append(site)
+        return "job-3"
+
+    monkeypatch.setattr(crawler_partials, "start_export", start_export)
+    response = crawler.post(f"{PARTIALS}/sites/export", data={"site": "rose.test"})
+    assert response.status_code == 200
+    assert asked == ["rose.test"]
+    assert location(response) == overseer_crawler.job_url("job-3")
+
+
+async def test_a_finished_export_shows_where_it_went(crawler: TestClient) -> None:
+    async def work(handle: Any) -> dict[str, Any]:
+        return StoredExport(
+            site="rose.test", key="exports/abc.zip", size=2048, pages=12, assets=3
+        ).model_dump()
+
+    runner = get_job_runner()
+    job_id = runner.start("crawler-export:rose.test", work)
+    await runner.wait(job_id)
+    box = one(_get(crawler, "crawl", f"job={job_id}"), "#crawler-job")
+    assert one(box, "[data-status]").get("data-status") == "done"
+    assert "exports/abc.zip" in text(box) and "12" in text(box)
 
 
 def test_an_unknown_site_has_no_drawer(crawler: TestClient) -> None:

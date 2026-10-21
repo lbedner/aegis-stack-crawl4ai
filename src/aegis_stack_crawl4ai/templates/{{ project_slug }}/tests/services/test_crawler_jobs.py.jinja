@@ -240,6 +240,28 @@ async def test_a_huge_crawl_does_not_ship_every_row(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_an_export_is_a_job_kind_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kind maps to the stored export; its result is the
+    ``StoredExport`` the API, the CLI and the Overseer read."""
+    from app.services.crawler.schemas import StoredExport
+
+    asked: list[str] = []
+
+    async def store(session: Any, site: str) -> StoredExport:
+        asked.append(site)
+        return StoredExport(site=site, key="k", size=3, pages=1, assets=0)
+
+    monkeypatch.setattr(jobs, "store_export", store)
+
+    kept = await jobs.run_job_kind("export", {"site": "a.test"})
+
+    assert asked == ["a.test"]
+    assert isinstance(kept, StoredExport) and kept.key == "k"
+
+
+@pytest.mark.asyncio
 async def test_start_crawl_returns_a_job_the_runner_knows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

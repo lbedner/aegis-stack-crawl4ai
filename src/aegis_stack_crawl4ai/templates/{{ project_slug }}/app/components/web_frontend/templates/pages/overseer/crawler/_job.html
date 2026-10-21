@@ -1,6 +1,7 @@
 {# A crawl job (overseer_crawler.job_context), streamed while the section
-   is open: its label while it runs, why it failed, or what it fetched. #}
-{% from "components/macros/layout.html" import card, stats_strip %}
+   is open: its label while it runs, why it failed, what it fetched, or
+   where an export went. #}
+{% from "components/macros/layout.html" import card, facts, stats_strip %}
 {% from "components/macros/table.html" import data_table %}
 {% call card("Job") %}
 {% if not job %}
@@ -11,6 +12,10 @@
 <p data-status="failed" class="text-sm text-error">{{ job.error }}</p>
 {% else %}
 <div data-status="done" class="space-y-4">
+  {% if job.export %}
+  {{ facts(job.export) }}
+  {% if job.export_url %}<a href="{{ job.export_url }}" class="text-xs text-aegis-teal hover:underline">Download (link good for a day)</a>{% endif %}
+  {% else %}
   {{ stats_strip([
     {"label": "Requested", "value": job.summary.requested if job.summary else 0},
     {"label": "Fetched", "value": job.summary.fetched if job.summary else 0},
@@ -22,6 +27,7 @@
     {"key": "type", "label": "Type"},
     {"key": "size", "label": "Size", "align": "right"},
   ], job.rows, empty="Nothing fetched") }}
+  {% endif %}
 </div>
 {% endif %}
 {% endcall %}

@@ -17,7 +17,7 @@ from app.core.formatting import format_bytes, format_relative_time
 from app.services.crawler import SERVICE_NAME, queries
 from app.services.crawler.deps import get_crawler
 from app.services.crawler.models import CrawledPage
-from app.services.crawler.schemas import MAX_DEPTH, CrawlSummary
+from app.services.crawler.schemas import MAX_DEPTH, CrawlSummary, StoredExport
 from app.services.system.jobs import get_job_runner
 from app.services.system.models import ComponentStatus
 
@@ -33,7 +33,6 @@ SECTIONS = (
 
 PAGE = page_url("services", SERVICE_NAME)
 PARTIALS = "/partials/overseer/crawler"
-API = "/api/v1/crawler"
 JOB = "pages/overseer/crawler/_job.html"
 EVENT = "crawler-job"
 INTERVAL_SECONDS = 1.0
@@ -128,7 +127,7 @@ async def site_context(db: Any, site: str) -> dict[str, Any] | None:
         "urls": {
             "pages": pages_url(site),
             "failed": pages_url(site, failed=True),
-            "export": f"{API}/sites/{site}/export",
+            "export": f"{PARTIALS}/sites/export",
             "assets": f"{PARTIALS}/sites/assets",
         },
     }
@@ -204,20 +203,31 @@ async def page_context(db: Any, page_id: int) -> dict[str, Any] | None:
 
 async def job_context(job_id: str) -> dict[str, Any] | None:
     """A crawl job as the Crawl section shows it: running with its label,
-    failed with why, or done with its ``CrawlSummary``."""
+    failed with why, or done with its ``CrawlSummary``, or with the
+    ``StoredExport`` an export job left."""
     job = await get_job_runner().lookup(job_id)
     if job is None:
         return None
-    summary = (
-        CrawlSummary.model_validate(job.result)
-        if job.status == "done" and job.result
-        else None
-    )
+    result = job.result if job.status == "done" and job.result else None
+    # The job's name says its kind (``start_export``), not its payload.
+    packed = job.name.startswith("crawler-export:")
+    kept = StoredExport.model_validate(result) if result and packed else None
+    summary = CrawlSummary.model_validate(result) if result and not packed else None
     return {
         "status": job.status,
         "label": job.label,
         "error": job.error,
         "summary": summary,
+        "export": [
+            ("Site", kept.site),
+            ("Pages", f"{kept.pages:,}"),
+            ("Assets", f"{kept.assets:,}"),
+            ("Size", format_bytes(kept.size)),
+            ("Key", kept.key),
+        ]
+        if kept
+        else None,
+        "export_url": kept.url if kept else None,
         "rows": [
             {
                 "url": p.url,

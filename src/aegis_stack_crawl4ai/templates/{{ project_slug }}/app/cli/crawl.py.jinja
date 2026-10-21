@@ -256,26 +256,32 @@ async def wayback(
     )
 
 
-async def _run_job(path: str, payload: dict[str, Any], *, noun: str = "page") -> None:
-    """Start a crawl job, follow its label until it lands, print what it got."""
+async def _follow(path: str, payload: dict[str, Any], *, doing: str) -> dict[str, Any]:
+    """Start a crawler job, follow its label until it lands; the job's
+    snapshot, or exit 1 with why it failed."""
     async with _client() as client:
         resp = await client.post(f"{API_PREFIX}{path}", json=payload)
         resp.raise_for_status()
         job_id = resp.json()["job_id"]
 
         console.print(f"[dim]job {job_id}[/dim]")
-        with console.status("Crawling...") as status:
+        with console.status(doing) as status:
             while True:
                 await asyncio.sleep(1.0)
                 job = (await client.get(f"/api/v1/jobs/{job_id}")).json()
-                status.update(job.get("label") or "Crawling...")
+                status.update(job.get("label") or doing)
                 if job.get("status") != "running":
                     break
 
     if job.get("status") != "done":
-        console.print(f"[red]{job.get('error') or 'The crawl failed.'}[/red]")
+        console.print(f"[red]{job.get('error') or 'The job failed.'}[/red]")
         raise typer.Exit(1)
+    return job
 
+
+async def _run_job(path: str, payload: dict[str, Any], *, noun: str = "page") -> None:
+    """Start a crawl job, follow it, print what it got."""
+    job = await _follow(path, payload, doing="Crawling...")
     summary = CrawlSummary.model_validate(job.get("result") or {})
     rows = [page.model_dump() for page in summary.pages]
     console.print(_fetch_table(f"Crawled {summary.fetched} {noun}(s)", rows, url="url"))
@@ -303,14 +309,9 @@ async def export(
     and a manifest.json naming them all, as one zip. Its home is the
     object store (the bucket), which outlives the stack; a directory is
     for looking at it here. Re-running overwrites the directory."""
-    timeout = httpx.Timeout(600.0)
     if directory is None:
-        async with _client() as client:
-            resp = await client.post(
-                f"{API_PREFIX}/sites/{site}/export", timeout=timeout
-            )
-            resp.raise_for_status()
-            kept = StoredExport.model_validate(resp.json())
+        job = await _follow(f"/sites/{site}/export", {}, doing="Packing...")
+        kept = StoredExport.model_validate(job.get("result") or {})
         console.print(
             f"[green]✓[/green] {kept.pages} page(s), {kept.assets} asset(s), "
             f"{format_bytes(kept.size)} → [cyan]{kept.key}[/cyan]"
@@ -319,7 +320,9 @@ async def export(
             console.print(f"[dim]{kept.url}[/dim]")
         return
     async with _client() as client:
-        resp = await client.get(f"{API_PREFIX}/sites/{site}/export", timeout=timeout)
+        resp = await client.get(
+            f"{API_PREFIX}/sites/{site}/export", timeout=httpx.Timeout(600.0)
+        )
         resp.raise_for_status()
     archive = zipfile.ZipFile(io.BytesIO(resp.content))
     archive.extractall(directory)

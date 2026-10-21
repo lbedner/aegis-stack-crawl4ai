@@ -1,6 +1,6 @@
 {# One site in the drawer: its counts, its pages (all, or the failed),
-   the site as a zip of plain files, and a fetch of the assets its pages
-   name that the store lacks. #}
+   its export packed into the object store, and a fetch of the assets its
+   pages name that the store lacks; the Crawl section follows both. #}
 {% from "components/macros/layout.html" import card, dialog_title, facts %}
 {% from "components/macros/form.html" import action %}
 <div class="space-y-4">
@@ -8,8 +8,8 @@
   <div class="flex flex-wrap items-center gap-2">
     <a href="{{ urls.pages }}" {{ hx_replace(urls.pages, "#overseer-main") }} class="px-2.5 py-1 text-xs rounded border border-aegis-border text-aegis-muted hover:text-aegis-text hover:border-aegis-muted transition-colors">Pages</a>
     {% if site.failed %}<a href="{{ urls.failed }}" {{ hx_replace(urls.failed, "#overseer-main") }} class="px-2.5 py-1 text-xs rounded border border-aegis-border text-aegis-muted hover:text-aegis-text hover:border-aegis-muted transition-colors">Failed</a>{% endif %}
-    <a href="{{ urls.export }}" download class="px-2.5 py-1 text-xs rounded border border-aegis-border text-aegis-muted hover:text-aegis-text hover:border-aegis-muted transition-colors">Export</a>
-    {{ action("Assets", 'hx-post="' ~ urls.assets ~ '" hx-vals=\'' ~ {"site": site.site}|tojson ~ '\' hx-swap="none" data-write', "primary") }}
+    {{ action("Export", 'hx-post="' ~ urls.export ~ '" hx-swap="none" data-write', vals={"site": site.site}) }}
+    {{ action("Assets", 'hx-post="' ~ urls.assets ~ '" hx-swap="none" data-write', "primary", vals={"site": site.site}) }}
   </div>
   {% call card("Details", id="crawler-site-facts") %}{{ facts(details) }}{% endcall %}
 </div>
