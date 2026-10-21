@@ -120,6 +120,7 @@ def get_spec() -> PluginSpec:
                 "tests/services/test_crawler_assets.py",
                 "tests/services/test_crawler_export.py",
                 "tests/services/test_crawler_jobs.py",
+                "tests/services/test_crawler_tools.py",
                 "tests/services/test_crawler_layout.py",
                 "tests/services/test_crawler_options.py",
                 "tests/services/test_crawler_sites.py",

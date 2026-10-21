@@ -265,3 +265,12 @@ class CrawledAssetRead(BaseModel):
     fetched_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+
+def summary_of(page: Any) -> dict[str, Any]:
+    """A stored page as its summary, body left out: what a list carries."""
+    return CrawledPageSummary.model_validate(page).model_dump(
+        mode="json", exclude={"content"}
+    )
+
