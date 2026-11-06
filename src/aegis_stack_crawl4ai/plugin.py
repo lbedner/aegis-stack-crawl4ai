@@ -61,7 +61,7 @@ def get_spec() -> PluginSpec:
         name="crawl4ai",
         kind=PluginKind.SERVICE,
         description="Web crawling and scraping via Crawl4AI",
-        version="0.1.0",
+        version="0.1.1",
         verified=False,
         # PEP 440 specifier. 0.16.0 is the framework that runs a plugin's
         # queue as its own ``worker-<queue>`` container; 0.16.1 is the one
