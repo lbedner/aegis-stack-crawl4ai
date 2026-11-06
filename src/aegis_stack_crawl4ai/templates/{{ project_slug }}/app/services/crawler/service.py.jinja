@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 import re
 from typing import Any
 
@@ -42,7 +41,6 @@ from app.services.crawler.models import CrawledPage
 from app.services.crawler.schemas import CrawlerSite, CrawlerStats, CrawlOptions
 from app.services.crawler.utils import same_site, site_of
 from app.services.system.activity import add_event
-
 
 # crawl4ai's HTTP strategy raises on any non-2xx, so the result it hands
 # back has ``status_code=None`` and the real status survives only in the
@@ -130,9 +128,7 @@ class CrawlerService:
         ``CRAWLER_USER_AGENT`` is a declared setting, so it is read here
         rather than left as a knob that turns nothing.
         """
-        return HTTPCrawlerConfig(
-            headers={"User-Agent": settings.CRAWLER_USER_AGENT}
-        )
+        return HTTPCrawlerConfig(headers={"User-Agent": settings.CRAWLER_USER_AGENT})
 
     @staticmethod
     def concurrency(requested: int | None = None) -> int:
@@ -377,7 +373,6 @@ class CrawlerService:
             },
             status_code=status_code,
             source_kind=source_kind,
-            fetched_at=datetime.now(UTC),
         )
         session.add(document)
         # No refresh after the commit: the session keeps its attributes

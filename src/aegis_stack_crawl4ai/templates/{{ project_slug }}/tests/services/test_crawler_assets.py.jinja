@@ -13,7 +13,7 @@ import pytest
 
 from app.core.storage import FilesystemStorage, set_storage
 from app.services.crawler.domains.assets import discover, fetch_assets
-from app.services.crawler.models import CrawledPage
+from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.utils import site_of
 
 # Each page asks once what its site has settled, so two pages are two of
@@ -32,6 +32,19 @@ PAGE = """
 <a href="about.htm">about</a>
 </body></html>
 """
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        lambda: CrawledPage(source_url="http://a.test/"),
+        lambda: CrawledAsset(site="a.test", original_url="http://a.test/x.gif"),
+    ],
+)
+def test_fetched_at_is_the_naive_utc_its_column_stores(row: Any) -> None:
+    # The column is a timestamp without a zone, and asyncpg refuses an
+    # aware value for it: every insert failed on Postgres.
+    assert row().fetched_at.tzinfo is None
 
 
 class TestDiscover:
@@ -57,7 +70,9 @@ def _transport(hits: list[str]) -> httpx.MockTransport:
         hits.append(str(request.url))
         if request.url.path.endswith("missing.png"):
             return httpx.Response(404)
-        return httpx.Response(200, content=b"GIF89a", headers={"content-type": "image/gif"})
+        return httpx.Response(
+            200, content=b"GIF89a", headers={"content-type": "image/gif"}
+        )
 
     return httpx.MockTransport(handle)
 

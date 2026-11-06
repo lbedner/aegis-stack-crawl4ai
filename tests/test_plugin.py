@@ -97,6 +97,18 @@ class TestIdentity:
         )
         assert "aegis-stack>=0.16.1" in pyproject["project"]["dependencies"]
 
+    def test_repository_is_this_plugin(self) -> None:
+        """The plugin directory on aegis-stack.io shows the stars of the repo
+        declared under ``Repository``. Without one it takes any GitHub link,
+        and Crawl4AI's own is listed here too."""
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        assert (
+            pyproject["project"]["urls"]["Repository"]
+            == "https://github.com/lbedner/aegis-stack-crawl4ai"
+        )
+
 
 class TestSchemaIsolation:
     """The plugin's tables live in their own Postgres schema."""

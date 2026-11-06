@@ -10,7 +10,6 @@ did, and archive.org's turn applies.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
@@ -90,7 +89,6 @@ async def _fetch_one(
         page_id=page.id,
         site=str(page.site),
         original_url=url,
-        fetched_at=datetime.now(UTC),
     )
     try:
         response = await patiently(
