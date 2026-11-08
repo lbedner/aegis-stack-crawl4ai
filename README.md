@@ -50,7 +50,7 @@ code.
 
 ## Install
 
-Inside an Aegis Stack project (aegis-stack 0.16.1 or later):
+Inside an Aegis Stack project (aegis-stack 0.19.1 or later):
 
 ```bash
 uv pip install aegis-stack-crawl4ai

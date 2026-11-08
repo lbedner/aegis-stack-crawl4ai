@@ -28,8 +28,8 @@ from app.components.backend.api.crawler import API_PREFIX
 from app.core.config import settings
 from app.core.constants import Defaults
 from app.core.formatting import format_bytes, format_relative_time
-from app.services.crawler.domains.export import MANIFEST
 from app.services.crawler.schemas import (
+    MANIFEST,
     MAX_DEPTH,
     CrawlOptions,
     CrawlSummary,
@@ -93,9 +93,7 @@ def _parse_metadata(pairs: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for pair in pairs:
         if "=" not in pair:
-            raise typer.BadParameter(
-                f"--metadata expects key=value, got {pair!r}"
-            )
+            raise typer.BadParameter(f"--metadata expects key=value, got {pair!r}")
         key, raw = pair.split("=", 1)
         try:
             out[key] = json.loads(raw)
@@ -242,9 +240,7 @@ async def wayback(
 ) -> None:
     """One CDX listing, then the latest capture of each page, filed
     under its original URL."""
-    options = CrawlOptions(
-        include=include, exclude=exclude, fresh=fresh, assets=assets
-    )
+    options = CrawlOptions(include=include, exclude=exclude, fresh=fresh, assets=assets)
     await _run_job(
         "/wayback",
         {

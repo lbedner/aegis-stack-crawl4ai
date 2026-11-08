@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-import re
+from datetime import UTC, datetime
 from typing import Any
 
 from crawl4ai import (
@@ -33,72 +33,50 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
 from app.core.log import logger
-from app.core.storage import content_key
 from app.services.crawler import queries
-from app.services.crawler.domains.archive import THROTTLED, paced, patiently, resolve
+from app.services.crawler.domains.archive import paced, patiently, resolve
 from app.services.crawler.domains.assets import fetch_assets
-from app.services.crawler.models import CrawledPage
+from app.services.crawler.domains.export import export_site, store_export
+from app.services.crawler.domains.results import (
+    each,
+    hash_content,
+    page_metadata,
+    status_from_error,
+    throttled,
+)
+from app.services.crawler.domains.wayback import enumerate_site
+from app.services.crawler.models import CrawledAsset, CrawledPage
+from app.services.crawler.queries import (
+    page,
+    page_assets,
+    site_assets,
+    site_page_keys,
+    site_pages,
+    stored_asset,
+)
 from app.services.crawler.schemas import CrawlerSite, CrawlerStats, CrawlOptions
 from app.services.crawler.utils import same_site, site_of
 from app.services.system.activity import add_event
 
-# crawl4ai's HTTP strategy raises on any non-2xx, so the result it hands
-# back has ``status_code=None`` and the real status survives only in the
-# error text: "HTTP 404: Unexpected status code for <url>".
-_STATUS_IN_ERROR = re.compile(r"HTTP (\d{3}):")
-
-# Page metadata crawl4ai parses out of the document, worth keeping on the
-# row. Anything else the caller wants, they pass in.
-_METADATA_KEYS = ("title", "description", "keywords", "author")
-
-
-def _status_from_error(message: str | None) -> int | None:
-    """The HTTP status buried in a crawl4ai error message, if it is one."""
-    match = _STATUS_IN_ERROR.search(message or "")
-    return int(match.group(1)) if match else None
-
-
-async def _each(outcome: Any) -> AsyncIterator[Any]:
-    """One result, a list of them, or a stream of them, as a stream."""
-    if hasattr(outcome, "__aiter__"):
-        async for result in outcome:
-            yield result
-        return
-    for result in outcome if isinstance(outcome, list) else [outcome]:
-        yield result
-
-
-def _throttled(outcome: Any) -> bool:
-    """Whether the host asked for a pause; a deep crawl's stream never does."""
-    if not hasattr(outcome, "success") or getattr(outcome, "success", False):
-        return False
-    status = getattr(outcome, "status_code", None) or _status_from_error(
-        getattr(outcome, "error_message", None)
-    )
-    return status in THROTTLED
-
-
-def _page_metadata(result: Any) -> dict[str, Any]:
-    """Title, description, keywords, author — whichever the page had."""
-    parsed = getattr(result, "metadata", None) or {}
-    return {
-        key: parsed[key]
-        for key in _METADATA_KEYS
-        if isinstance(parsed, dict) and parsed.get(key)
-    }
-
-
-def _hash_content(content: str | None) -> str | None:
-    """The digest half of the framework's content key.
-
-    ``app.core.storage.content_key`` is the project-wide way to address
-    bytes by what they are; using its digest here means this column and a
-    stored object agree on identity, so bodies could move into the object
-    store later without rehashing a single row.
-    """
-    if not content:
-        return None
-    return content_key(content.encode("utf-8")).rsplit("/", 1)[-1]
+# What the crawler offers its ways in (router, jobs, tools, the CLI, its
+# Overseer page) and other services: they import it from here, never from
+# its queries, models or domains.
+__all__ = [
+    "CrawledAsset",
+    "CrawledPage",
+    "CrawlerService",
+    "enumerate_site",
+    "export_site",
+    "fetch_assets",
+    "page",
+    "page_assets",
+    "resolve",
+    "site_assets",
+    "site_page_keys",
+    "site_pages",
+    "store_export",
+    "stored_asset",
+]
 
 
 class CrawlerService:
@@ -237,7 +215,7 @@ class CrawlerService:
         options = options or CrawlOptions()
         outcome = await self._run(url, options)
         seed = resolve(url).url
-        async for result in _each(outcome):
+        async for result in each(outcome):
             # Stored as it was reached: a snapshot URL keeps its archive
             # metadata through ``_store``'s own resolve.
             reached = str(getattr(result, "url", "") or url)
@@ -278,7 +256,7 @@ class CrawlerService:
             # crawl4ai wraps ``arun`` in a decorator whose annotation reads
             # as an unbound-or-bound union to the type checker.
             lambda: crawler.arun(url=fetch_url, config=config),  # ty: ignore[missing-argument]
-            _throttled,
+            throttled,
         )
 
     async def _store(
@@ -312,7 +290,7 @@ class CrawlerService:
         else:
             status_code = (
                 getattr(result, "status_code", None)
-                or _status_from_error(getattr(result, "error_message", None))
+                or status_from_error(getattr(result, "error_message", None))
                 # Nothing said what went wrong: a timeout, a DNS miss, a
                 # refused connection. 599 is the catch-all, not the norm.
                 or 599
@@ -332,7 +310,7 @@ class CrawlerService:
                 getattr(result, "error_message", None),
             )
 
-        new_hash = _hash_content(content)
+        new_hash = hash_content(content)
 
         # Dedup gate — on by default, off when caller passed
         # ``fresh=True``. Same URL + same content hash + previous
@@ -366,13 +344,14 @@ class CrawlerService:
             content_hash=new_hash,
             content_type=content_type,
             doc_metadata={
-                **_page_metadata(result),
+                **page_metadata(result),
                 **target.doc_metadata,
                 **(doc_metadata or {}),
                 **flagged,
             },
             status_code=status_code,
             source_kind=source_kind,
+            fetched_at=datetime.now(UTC),
         )
         session.add(document)
         # No refresh after the commit: the session keeps its attributes

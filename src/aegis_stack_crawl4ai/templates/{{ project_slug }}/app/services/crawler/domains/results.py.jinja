@@ -1,0 +1,70 @@
+"""What a crawl4ai result says once it is back: the HTTP status hidden in its
+error, whether the host asked for a pause, the page's metadata worth
+keeping, and the body's content hash."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+import re
+from typing import Any
+
+from app.core.storage import content_key
+from app.services.crawler.domains.archive import THROTTLED
+
+# crawl4ai's HTTP strategy raises on any non-2xx, so the result it hands
+# back has ``status_code=None`` and the real status survives only in the
+# error text: "HTTP 404: Unexpected status code for <url>".
+_STATUS_IN_ERROR = re.compile(r"HTTP (\d{3}):")
+
+# Page metadata crawl4ai parses out of the document, worth keeping on the
+# row. Anything else the caller wants, they pass in.
+_METADATA_KEYS = ("title", "description", "keywords", "author")
+
+
+def status_from_error(message: str | None) -> int | None:
+    """The HTTP status buried in a crawl4ai error message, if it is one."""
+    match = _STATUS_IN_ERROR.search(message or "")
+    return int(match.group(1)) if match else None
+
+
+async def each(outcome: Any) -> AsyncIterator[Any]:
+    """One result, a list of them, or a stream of them, as a stream."""
+    if hasattr(outcome, "__aiter__"):
+        async for result in outcome:
+            yield result
+        return
+    for result in outcome if isinstance(outcome, list) else [outcome]:
+        yield result
+
+
+def throttled(outcome: Any) -> bool:
+    """Whether the host asked for a pause; a deep crawl's stream never does."""
+    if not hasattr(outcome, "success") or getattr(outcome, "success", False):
+        return False
+    status = getattr(outcome, "status_code", None) or status_from_error(
+        getattr(outcome, "error_message", None)
+    )
+    return status in THROTTLED
+
+
+def page_metadata(result: Any) -> dict[str, Any]:
+    """Title, description, keywords, author — whichever the page had."""
+    parsed = getattr(result, "metadata", None) or {}
+    return {
+        key: parsed[key]
+        for key in _METADATA_KEYS
+        if isinstance(parsed, dict) and parsed.get(key)
+    }
+
+
+def hash_content(content: str | None) -> str | None:
+    """The digest half of the framework's content key.
+
+    ``app.core.storage.content_key`` is the project-wide way to address
+    bytes by what they are; using its digest here means this column and a
+    stored object agree on identity, so bodies could move into the object
+    store later without rehashing a single row.
+    """
+    if not content:
+        return None
+    return content_key(content.encode("utf-8")).rsplit("/", 1)[-1]

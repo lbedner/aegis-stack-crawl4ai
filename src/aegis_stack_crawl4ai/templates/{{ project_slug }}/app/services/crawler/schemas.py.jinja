@@ -132,6 +132,10 @@ class CrawlSummary(BaseModel):
     pages: list[CrawledPageResult] = Field(default_factory=list)
 
 
+MANIFEST = "manifest.json"
+"""The file in an export that lists its pages and assets."""
+
+
 class StoredExport(BaseModel):
     """A site's export in the object store: its pages and manifest under
     one content key, its assets under the keys the manifest names."""
@@ -156,10 +160,10 @@ class BatchCrawlRequest(BaseModel):
     def _accept_bare_domains(cls, value: Any) -> Any:
         if isinstance(value, list):
             return [
-                normalize_url(item) if isinstance(item, str) else item
-                for item in value
+                normalize_url(item) if isinstance(item, str) else item for item in value
             ]
         return value
+
     source_kind: str = Field(
         default="crawl4ai",
         max_length=32,
@@ -197,6 +201,7 @@ class CrawlRequest(BaseModel):
     @classmethod
     def _accept_a_bare_domain(cls, value: Any) -> Any:
         return normalize_url(value) if isinstance(value, str) else value
+
     doc_metadata: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -227,14 +232,12 @@ class CrawlRequest(BaseModel):
     )
 
 
-class CrawledPageSummary(BaseModel):
-    """Outbound shape of a stored document in a listing: everything but
-    the HTML, which the listing query does not even load."""
+class CrawledPageListing(BaseModel):
+    """A stored page as a list carries it: what is known about it, no body."""
 
     id: int
     source_url: str
     site: str | None
-    content: str | None
     content_hash: str | None
     content_type: str
     doc_metadata: dict[str, Any]
@@ -243,6 +246,13 @@ class CrawledPageSummary(BaseModel):
     fetched_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class CrawledPageSummary(CrawledPageListing):
+    """Outbound shape of a stored document: its markdown too, but not the
+    HTML, which the listing query does not even load."""
+
+    content: str | None
 
 
 class CrawledPageRead(CrawledPageSummary):
@@ -265,12 +275,3 @@ class CrawledAssetRead(BaseModel):
     fetched_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-
-def summary_of(page: Any) -> dict[str, Any]:
-    """A stored page as its summary, body left out: what a list carries."""
-    return CrawledPageSummary.model_validate(page).model_dump(
-        mode="json", exclude={"content"}
-    )
-
