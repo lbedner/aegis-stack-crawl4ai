@@ -88,14 +88,15 @@ class TestIdentity:
         assert get_spec().version == pyproject["project"]["version"]
 
     def test_aegis_version_pinned(self) -> None:
-        """The floor is the framework that runs a plugin's queue as its
-        own worker container; the spec and the package agree on it."""
+        """The floor is the framework that reads a tool's model back and
+        answers a started job with a typed model; the spec and the package
+        agree on it."""
         spec = get_spec()
-        assert spec.aegis_version == ">=0.16.1"
+        assert spec.aegis_version == ">=0.19.1"
         pyproject = tomllib.loads(
             (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
         )
-        assert "aegis-stack>=0.16.1" in pyproject["project"]["dependencies"]
+        assert "aegis-stack>=0.19.1" in pyproject["project"]["dependencies"]
 
     def test_repository_is_this_plugin(self) -> None:
         """The plugin directory on aegis-stack.io shows the stars of the repo

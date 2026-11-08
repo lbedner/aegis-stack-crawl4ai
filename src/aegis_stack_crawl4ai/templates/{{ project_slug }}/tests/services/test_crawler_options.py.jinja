@@ -9,12 +9,9 @@ from typing import Any
 
 import pytest
 
+from app.services.crawler.domains.results import page_metadata, status_from_error
 from app.services.crawler.schemas import CrawlOptions
-from app.services.crawler.service import (
-    CrawlerService,
-    _page_metadata,
-    _status_from_error,
-)
+from app.services.crawler.service import CrawlerService
 from app.services.crawler.utils import same_site
 
 
@@ -238,12 +235,12 @@ class TestFailureStatus:
             "Error: HTTP request failed: HTTP 404: Unexpected status code "
             "for https://example.test/missing"
         )
-        assert _status_from_error(message) == 404
+        assert status_from_error(message) == 404
 
     def test_an_error_with_no_status_stays_unknown(self) -> None:
         """A timeout or a DNS miss names no status — the caller's 599."""
-        assert _status_from_error("Connection timed out") is None
-        assert _status_from_error(None) is None
+        assert status_from_error("Connection timed out") is None
+        assert status_from_error(None) is None
 
 
 class TestPageMetadata:
@@ -260,7 +257,7 @@ class TestPageMetadata:
                 "internal": "dropped",
             }
 
-        assert _page_metadata(_Result()) == {
+        assert page_metadata(_Result()) == {
             "title": "About",
             "description": "A page",
             "author": "Someone",
@@ -270,7 +267,7 @@ class TestPageMetadata:
         class _Result:
             metadata = None
 
-        assert _page_metadata(_Result()) == {}
+        assert page_metadata(_Result()) == {}
 
 
 class TestSiteOf:

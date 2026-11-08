@@ -14,10 +14,11 @@ from functools import partial
 from typing import Any
 
 from app.core.formatting import format_bytes, format_relative_time
-from app.services.crawler import SERVICE_NAME, queries
+from app.services.crawler import SERVICE_NAME
 from app.services.crawler.deps import get_crawler
-from app.services.crawler.models import CrawledPage
 from app.services.crawler.schemas import MAX_DEPTH, CrawlSummary, StoredExport
+from app.services.crawler.service import CrawledPage, page_assets, site_assets
+from app.services.crawler.service import page as stored_page
 from app.services.system.jobs import get_job_runner
 from app.services.system.models import ComponentStatus
 
@@ -114,7 +115,7 @@ async def site_context(db: Any, site: str) -> dict[str, Any] | None:
     found = next((s for s in await get_crawler().sites(db) if s.site == site), None)
     if found is None:
         return None
-    assets = await queries.site_assets(db, site)
+    assets = await site_assets(db, site)
     return {
         "site": found,
         "details": [
@@ -140,7 +141,7 @@ async def _pages(req: SectionRequest) -> dict[str, Any]:
         req.db, limit=LIST_SIZE, failed_only=failed, site=site
     )
     raw = req.query.get(PAGE_PARAM) or ""
-    shown = await req.db.get(CrawledPage, int(raw)) if raw.isdigit() else None
+    shown = await stored_page(req.db, int(raw)) if raw.isdigit() else None
     return drawer_state(
         PAGE_PARAM, f"{PARTIALS}/pages/{shown.id}/drawer" if shown else None
     ) | {
@@ -172,7 +173,7 @@ async def _pages(req: SectionRequest) -> dict[str, Any]:
 
 async def page_context(db: Any, page_id: int) -> dict[str, Any] | None:
     """The drawer's context for one stored page, or None when it is gone."""
-    page = await db.get(CrawledPage, page_id)
+    page = await stored_page(db, page_id)
     if page is None or page.id is None:
         return None
     return {
@@ -196,7 +197,7 @@ async def page_context(db: Any, page_id: int) -> dict[str, Any] | None:
                     "ok" if a.storage_key else "error",
                 ),
             }
-            for a in await queries.page_assets(db, page.id)
+            for a in await page_assets(db, page.id)
         ],
     }
 

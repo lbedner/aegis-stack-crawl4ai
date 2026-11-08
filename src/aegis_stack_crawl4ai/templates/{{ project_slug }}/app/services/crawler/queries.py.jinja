@@ -7,6 +7,7 @@ through here, which is what makes an N+1 audit a read of one file.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -189,24 +190,37 @@ def _newest(model: Any, key: Any, *where: ColumnElement[bool]) -> Any:
 
 
 async def site_pages(
-    db: AsyncSession, site: str, *, path_like: str | None = None
+    db: AsyncSession, site: str, *, like: Sequence[str] = (), markdown: bool = True
 ) -> list[CrawledPage]:
     """Every page of a site, its latest successful fetch only, by URL;
-    ``path_like`` (a SQL pattern on the URL) narrows to a part of it.
+    ``like`` (SQL patterns on the URL) narrows to the pages matching any
+    of them, several shapes of page in one read. ``markdown`` False
+    leaves the markdown body unloaded, for a reader of the HTML alone.
 
     Only the newest row per URL leaves the database; the stale bodies
     of earlier fetches are never loaded.
     """
     within = [CrawledPage.site == site, not_(_FAILED)]
-    if path_like is not None:
-        within.append(col(CrawledPage.source_url).like(path_like))
+    if like:
+        within.append(or_(*[col(CrawledPage.source_url).like(p) for p in like]))
     newest = _newest(CrawledPage, CrawledPage.source_url, *within)
-    rows = await db.exec(
-        select(CrawledPage)
-        .where(CrawledPage.id.in_(newest))
-        .order_by(CrawledPage.source_url)
-    )
+    read = select(CrawledPage).where(CrawledPage.id.in_(newest))
+    if not markdown:
+        read = read.options(defer(col(CrawledPage.content)))
+    rows = await db.exec(read.order_by(CrawledPage.source_url))
     return list(rows.all())
+
+
+async def page(db: AsyncSession, page_id: int) -> CrawledPage | None:
+    """One stored page, whole."""
+    return await db.get(CrawledPage, page_id)
+
+
+async def stored_asset(db: AsyncSession, key: str) -> CrawledAsset | None:
+    """The asset whose bytes are the object at ``key`` (for its content
+    type, when serving it)."""
+    rows = await db.exec(select(CrawledAsset).where(CrawledAsset.storage_key == key))
+    return rows.first()
 
 
 async def site_assets(db: AsyncSession, site: str) -> list[CrawledAsset]:

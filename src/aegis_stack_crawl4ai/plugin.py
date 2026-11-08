@@ -65,8 +65,10 @@ def get_spec() -> PluginSpec:
         verified=False,
         # PEP 440 specifier. 0.16.0 is the framework that runs a plugin's
         # queue as its own ``worker-<queue>`` container; 0.16.1 is the one
-        # that reads ``overseer_pages`` and gates a plugin's ``extras``.
-        aegis_version=">=0.16.1",
+        # that reads ``overseer_pages`` and gates a plugin's ``extras``;
+        # 0.19.1 reads a tool's model back (``result_data``) and answers a
+        # started job with ``JobStartedResponse``.
+        aegis_version=">=0.19.1",
         # CLI verb the plugin exposes in the generated project. Decoupled
         # from the install identifier (``crawl4ai``) so users type the
         # natural ``<project> crawl ...`` instead of the package name.

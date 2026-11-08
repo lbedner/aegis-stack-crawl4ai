@@ -20,11 +20,6 @@ running; without one, the crawl is a background task in this process.
 from typing import Any
 
 from app.core.db import AsyncSessionLocal
-from app.services.crawler import queries
-from app.services.crawler.domains.archive import resolve
-from app.services.crawler.domains.assets import fetch_assets
-from app.services.crawler.domains.export import store_export
-from app.services.crawler.models import CrawledPage
 from app.services.crawler.schemas import (
     CrawledPageResult,
     CrawlOptions,
@@ -32,9 +27,17 @@ from app.services.crawler.schemas import (
     StoredExport,
     WaybackRequest,
 )
-from app.services.crawler.service import CrawlerService
+from app.services.crawler.service import (
+    CrawledPage,
+    CrawlerService,
+    enumerate_site,
+    fetch_assets,
+    resolve,
+    site_page_keys,
+    site_pages,
+    store_export,
+)
 from app.services.crawler.utils import page_key, site_of
-from app.services.crawler.domains.wayback import enumerate_site
 from app.services.system.jobs import JobHandle, SetLabel, get_job_runner, unwatched
 
 PREVIEW_CHARS = 400
@@ -110,7 +113,7 @@ async def run_wayback(
         # Held by page, not by spelling: the live crawl's https://site/x
         # and the archive's http://www.site/x are one page.
         async with AsyncSessionLocal() as session:
-            held = await queries.site_page_keys(
+            held = await site_page_keys(
                 session, site_of(f"http://{request.domain}") or request.domain
             )
         snapshots = [url for url in snapshots if page_key(resolve(url).url) not in held]
@@ -125,7 +128,7 @@ async def run_assets(site: str, *, report: SetLabel = unwatched) -> CrawlSummary
     ``requested`` counts pages looked at; ``fetched`` and ``failed``
     count assets."""
     async with AsyncSessionLocal() as session:
-        pages = await queries.site_pages(session, site)
+        pages = await site_pages(session, site, markdown=False)
         fetched = failed = 0
         for index, page in enumerate(pages, 1):
             assets = await fetch_assets(session, page)

@@ -20,20 +20,18 @@ Endpoints:
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.components.backend.api.jobs import JobStartedResponse
 from app.core.db import get_async_db
-from app.services.crawler import queries
 from app.services.crawler.deps import get_crawler_service
-from app.services.crawler.domains.export import export_site
 from app.services.crawler.jobs import (
     start_assets,
     start_crawl,
     start_export,
     start_wayback,
 )
-from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
     BatchCrawlRequest,
     CrawledAssetRead,
@@ -44,7 +42,14 @@ from app.services.crawler.schemas import (
     CrawlRequest,
     WaybackRequest,
 )
-from app.services.crawler.service import CrawlerService
+from app.services.crawler.service import (
+    CrawledAsset,
+    CrawledPage,
+    CrawlerService,
+    export_site,
+)
+from app.services.crawler.service import page as stored_page
+from app.services.crawler.service import page_assets as assets_of
 
 router = APIRouter()
 
@@ -70,7 +75,7 @@ async def crawl_url(
 
 
 @router.post("/crawl-batch", status_code=status.HTTP_202_ACCEPTED)
-async def crawl_batch(payload: BatchCrawlRequest) -> JSONResponse:
+async def crawl_batch(payload: BatchCrawlRequest) -> JobStartedResponse:
     """Start a crawl in the background and hand back its job id.
 
     Progress is the framework's, not ours: the caller reads
@@ -81,18 +86,14 @@ async def crawl_batch(payload: BatchCrawlRequest) -> JSONResponse:
         options=payload.options,
         source_kind=payload.source_kind,
     )
-    return JSONResponse(
-        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
-    )
+    return JobStartedResponse(job_id=job_id)
 
 
 @router.post("/wayback", status_code=status.HTTP_202_ACCEPTED)
-async def crawl_wayback(payload: WaybackRequest) -> JSONResponse:
+async def crawl_wayback(payload: WaybackRequest) -> JobStartedResponse:
     """Fetch every archived page of a site, as a background job."""
     job_id = await start_wayback(payload)
-    return JSONResponse(
-        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
-    )
+    return JobStartedResponse(job_id=job_id)
 
 
 @router.get("/sites")
@@ -105,12 +106,10 @@ async def list_sites(
 
 
 @router.post("/sites/{site}/assets", status_code=status.HTTP_202_ACCEPTED)
-async def site_assets(site: str) -> JSONResponse:
+async def site_assets(site: str) -> JobStartedResponse:
     """Fetch every asset the site's stored pages name and do not have yet."""
     job_id = await start_assets(site)
-    return JSONResponse(
-        {"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED
-    )
+    return JobStartedResponse(job_id=job_id)
 
 
 @router.get("/sites/{site}/export")
@@ -128,12 +127,12 @@ async def export(
 
 
 @router.post("/sites/{site}/export", status_code=status.HTTP_202_ACCEPTED)
-async def keep_export(site: str) -> JSONResponse:
+async def keep_export(site: str) -> JobStartedResponse:
     """Pack the site's pages and manifest into the object store, as a job:
     its result is the ``StoredExport`` (the key, and a link when the
     store gives one)."""
     job_id = await start_export(site)
-    return JSONResponse({"job_id": job_id}, status_code=status.HTTP_202_ACCEPTED)
+    return JobStartedResponse(job_id=job_id)
 
 
 @router.get("/pages", response_model=list[CrawledPageSummary])
@@ -156,7 +155,7 @@ async def get_document(
     session: AsyncSession = Depends(get_async_db),
 ) -> CrawledPage:
     """Fetch a stored document by id."""
-    document = await session.get(CrawledPage, page_id)
+    document = await stored_page(session, page_id)
     if document is None:
         raise HTTPException(status_code=404, detail="CrawledPage not found")
     return document
@@ -168,7 +167,7 @@ async def page_assets(
     session: AsyncSession = Depends(get_async_db),
 ) -> list[CrawledAsset]:
     """The assets first seen on one stored page."""
-    return await queries.page_assets(session, page_id)
+    return await assets_of(session, page_id)
 
 
 @router.get("/stats")

@@ -47,3 +47,14 @@ def test_the_router_lives_with_the_other_routers() -> None:
 
     router = pytest.importorskip("app.components.backend.api.crawler.router")
     assert router.router.routes, "the router moved but lost its routes"
+
+
+def test_its_ways_in_go_through_its_facade() -> None:
+    """Its router, tools, jobs, the CLI, its pages and other services
+    reach it through service.py, never its queries, models or domains:
+    the project's own facade rules, held here because the project's
+    layout test checks its in-tree services only."""
+    service_parts = pytest.importorskip("app.services.system.service_parts")
+    crawler = dict(service_parts.folders())["service:crawler"]
+    assert not crawler.skipping, crawler.skipping
+    assert not crawler.reaching, crawler.reaching

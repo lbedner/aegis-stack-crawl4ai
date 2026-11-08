@@ -45,7 +45,9 @@ Crawl4AI 0.8.5 and earlier pull in a transitive `litellm` dependency that was
 
 The plugin follows the host project's own conventions rather than inventing its
 own: business logic under `app/services/`, reads in a `queries` module, the HTTP
-layer with the other routers, display code with the other dashboard code.
+layer with the other routers, display code with the other dashboard code. Its ways in (the
+router, jobs, tools, CLI and Overseer page) and other services reach it through `service.py`,
+never its queries, models or domains.
 
 ```
 aegis-stack-crawl4ai/
@@ -54,7 +56,7 @@ aegis-stack-crawl4ai/
 │   ├── plugin.py                         # get_spec() returns the PluginSpec
 │   └── templates/{{ project_slug }}/
 │       ├── app/services/crawler/
-│       │   ├── service.py                # AsyncWebCrawler wrapper
+│       │   ├── service.py                # AsyncWebCrawler wrapper; the facade (__all__)
 │       │   ├── queries.py                # every read, so an N+1 audit is one file
 │       │   ├── models.py                 # CrawledPage, CrawledAsset SQLModels
 │       │   ├── schemas.py                # CrawlOptions, request / response models
@@ -68,6 +70,7 @@ aegis-stack-crawl4ai/
 │       │       ├── archive.py            # Wayback snapshots, paced and retried
 │       │       ├── wayback.py            # a site listed from the CDX index
 │       │       ├── assets.py             # a page's images, scripts, downloads
+│       │       ├── results.py            # what a crawl4ai result says: status, metadata, hash
 │       │       └── export.py             # a site as a folder of plain files
 │       ├── app/components/backend/api/crawler/
 │       │   └── router.py                 # FastAPI router

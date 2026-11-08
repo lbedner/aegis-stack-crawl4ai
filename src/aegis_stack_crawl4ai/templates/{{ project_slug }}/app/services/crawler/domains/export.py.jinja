@@ -28,13 +28,13 @@ from app.core.storage import get_storage
 from app.services.crawler import queries
 from app.services.crawler.models import CrawledAsset, CrawledPage
 from app.services.crawler.schemas import (
+    MANIFEST,
     CrawledAssetRead,
+    CrawledPageListing,
     StoredExport,
-    summary_of,
 )
 from app.services.crawler.utils import live_first, site_of
 
-MANIFEST = "manifest.json"
 EXPORT_LINK_SECONDS = 24 * 3600
 """How long a link to a stored export stays good: a day, long enough to
 hand it to someone, short enough that a pasted link is not a leak."""
@@ -158,7 +158,13 @@ def _pack(
                 markdown, page.content or ""
             ):
                 manifest["pages"].append(
-                    {**summary_of(page), "html": html, "markdown": markdown}
+                    {
+                        **CrawledPageListing.model_validate(page).model_dump(
+                            mode="json"
+                        ),
+                        "html": html,
+                        "markdown": markdown,
+                    }
                 )
             else:
                 manifest["superseded"].append(page.source_url)
